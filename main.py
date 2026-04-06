@@ -1,12 +1,17 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response, Cookie
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 import requests
 import uuid
 import json
 import os
-import random
 from datetime import datetime
+from dotenv import load_dotenv
+
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
+from sqlalchemy.orm import declarative_base, sessionmaker
+
+load_dotenv()
 
 app = FastAPI(title="БИС Platform")
 
@@ -16,28 +21,158 @@ PEXELS_API_KEY = "99lzySAP7wyWqzFaBGPQQbcJWPwXZVaR6H6KbILjvJ5Au6iV6YnrxXM5"
 UNSPLASH_API_KEY = "NpF_z6xsa39ov1PS4Bq_AqIoabRJphW1s30RvnOGCMY"
 gigachat_access_token = None
 
+# ========== DATABASE ==========
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./bis_local.db")
+
+# SQLAlchemy requires postgresql:// scheme; Railway provides postgres://
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+
+class UserProfile(Base):
+    __tablename__ = "user_profiles"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String(64), unique=True, index=True, nullable=False)
+    niche = Column(String(256), default="")
+    tone = Column(String(256), default="")
+    city = Column(String(128), default="")
+    goal = Column(String(64), default="expert")
+    vk_token = Column(Text, default="")
+    group_id = Column(String(64), default="")
+
+
+class Post(Base):
+    __tablename__ = "posts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String(64), index=True, nullable=False)
+    text = Column(Text, nullable=False)
+    image_url = Column(Text, default="")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+# Create tables on startup
+Base.metadata.create_all(bind=engine)
+
+
+def _get_user_id(request: Request) -> str:
+    """Return the session user_id from cookie, creating one if absent."""
+    user_id = request.cookies.get("bis_user_id")
+    if not user_id:
+        user_id = str(uuid.uuid4())
+    return user_id
+
+
+def _db_get_profile(db, user_id: str) -> dict:
+    profile = db.query(UserProfile).filter(UserProfile.user_id == user_id).first()
+    if not profile:
+        return {}
+    return {
+        "niche": profile.niche,
+        "tone": profile.tone,
+        "city": profile.city,
+        "goal": profile.goal,
+        "vk_token": profile.vk_token,
+        "group_id": profile.group_id,
+    }
+
+
+def _db_save_profile(db, user_id: str, data: dict):
+    profile = db.query(UserProfile).filter(UserProfile.user_id == user_id).first()
+    if not profile:
+        profile = UserProfile(user_id=user_id)
+        db.add(profile)
+    profile.niche = data.get("niche", "")
+    profile.tone = data.get("tone", "")
+    profile.city = data.get("city", "")
+    profile.goal = data.get("goal", "expert")
+    profile.vk_token = data.get("vk_token", "")
+    profile.group_id = data.get("group_id", "")
+    db.commit()
+
+
+def _db_get_posts(db, user_id: str) -> list:
+    posts = db.query(Post).filter(Post.user_id == user_id).order_by(Post.created_at).all()
+    return [
+        {
+            "id": p.id,
+            "text": p.text,
+            "image_url": p.image_url or "",
+            "date": p.created_at.strftime("%Y-%m-%d %H:%M") if p.created_at else "",
+        }
+        for p in posts
+    ]
+
+
+def _db_add_post(db, user_id: str, text: str, image_url: str, date_str: str = None):
+    created_at = datetime.utcnow()
+    if date_str:
+        try:
+            created_at = datetime.strptime(date_str, "%Y-%m-%d %H:%M")
+        except Exception:
+            pass
+    post = Post(user_id=user_id, text=text, image_url=image_url or "", created_at=created_at)
+    db.add(post)
+    db.commit()
+    db.refresh(post)
+    return post
+
+
+def _db_get_post_by_index(db, user_id: str, index: int):
+    posts = db.query(Post).filter(Post.user_id == user_id).order_by(Post.created_at).all()
+    if index < 0 or index >= len(posts):
+        return None
+    return posts[index]
+
+
+def _db_delete_post_by_index(db, user_id: str, index: int) -> bool:
+    posts = db.query(Post).filter(Post.user_id == user_id).order_by(Post.created_at).all()
+    if index < 0 or index >= len(posts):
+        return False
+    db.delete(posts[index])
+    db.commit()
+    return True
+
+
+# ========== MIGRATE LEGACY JSON ==========
 USER_DATA_FILE = "user_data.json"
 
 
-def load_user_data():
-    if os.path.exists(USER_DATA_FILE):
-        try:
-            with open(USER_DATA_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except:
-            return {}
-    return {}
+def _migrate_json_to_db():
+    """One-time migration: import user_data.json into the DB under a legacy user_id."""
+    if not os.path.exists(USER_DATA_FILE):
+        return
+    try:
+        with open(USER_DATA_FILE, "r", encoding="utf-8") as f:
+            legacy = json.load(f)
+    except Exception:
+        return
+    if not legacy:
+        return
+    legacy_user_id = "legacy_migration_user"
+    db = SessionLocal()
+    try:
+        existing = db.query(UserProfile).filter(UserProfile.user_id == legacy_user_id).first()
+        if existing:
+            return  # already migrated
+        profile_data = legacy.get("profile", {})
+        if profile_data:
+            _db_save_profile(db, legacy_user_id, profile_data)
+        for post in legacy.get("posts", []):
+            _db_add_post(db, legacy_user_id, post.get("text", ""), post.get("image_url", ""), post.get("date"))
+        os.rename(USER_DATA_FILE, USER_DATA_FILE + ".migrated")
+    except Exception as e:
+        print(f"Migration error: {e}")
+    finally:
+        db.close()
 
 
-def save_user_data(data):
-    with open(USER_DATA_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-user_data = load_user_data()
-if "posts" not in user_data:
-    user_data["posts"] = []
-    save_user_data(user_data)
+_migrate_json_to_db()
 
 
 # ========== GIGACHAT ==========
@@ -595,6 +730,7 @@ WORKSPACE_PAGE = """
 """
 
 from pydantic import BaseModel
+from typing import Optional
 
 
 class GenerateRequest(BaseModel):
@@ -603,15 +739,15 @@ class GenerateRequest(BaseModel):
 
 class PublishRequest(BaseModel):
     text: str
-    image_url: str = None
-    vk_token: str = None
-    group_id: str = None
+    image_url: Optional[str] = None
+    vk_token: Optional[str] = None
+    group_id: Optional[str] = None
 
 
 class AddPostRequest(BaseModel):
     text: str
-    image_url: str = None
-    date: str = None
+    image_url: Optional[str] = None
+    date: Optional[str] = None
 
 
 class PublishFromPlanRequest(BaseModel):
@@ -624,10 +760,18 @@ class DeletePostRequest(BaseModel):
     index: int
 
 
+# ========== API ENDPOINTS ==========
+
 @app.post("/api/generate")
-async def generate(request: GenerateRequest):
-    profile = user_data.get("profile", {})
-    result = call_gigachat(request.prompt, profile)
+async def generate(req: GenerateRequest, request: Request, response: Response):
+    user_id = _get_user_id(request)
+    response.set_cookie(key="bis_user_id", value=user_id, max_age=60 * 60 * 24 * 365, httponly=True, samesite="lax")
+    db = SessionLocal()
+    try:
+        profile = _db_get_profile(db, user_id)
+    finally:
+        db.close()
+    result = call_gigachat(req.prompt, profile)
     return JSONResponse(content={"result": result})
 
 
@@ -640,68 +784,95 @@ async def generate_image(prompt: str):
 
 
 @app.post("/api/add-to-plan")
-async def add_to_plan(request: AddPostRequest):
-    if "posts" not in user_data:
-        user_data["posts"] = []
-    user_data["posts"].append({
-        "text": request.text,
-        "image_url": request.image_url,
-        "date": request.date or datetime.now().strftime("%Y-%m-%d %H:%M")
-    })
-    save_user_data(user_data)
+async def add_to_plan(req: AddPostRequest, request: Request, response: Response):
+    user_id = _get_user_id(request)
+    response.set_cookie(key="bis_user_id", value=user_id, max_age=60 * 60 * 24 * 365, httponly=True, samesite="lax")
+    db = SessionLocal()
+    try:
+        _db_add_post(db, user_id, req.text, req.image_url or "", req.date)
+    finally:
+        db.close()
     return JSONResponse(content={"message": "✅ Пост добавлен в контент-план!"})
 
 
 @app.get("/api/get-posts")
-async def get_posts():
-    return JSONResponse(content=user_data.get("posts", []))
+async def get_posts(request: Request, response: Response):
+    user_id = _get_user_id(request)
+    response.set_cookie(key="bis_user_id", value=user_id, max_age=60 * 60 * 24 * 365, httponly=True, samesite="lax")
+    db = SessionLocal()
+    try:
+        posts = _db_get_posts(db, user_id)
+    finally:
+        db.close()
+    return JSONResponse(content=posts)
 
 
 @app.post("/api/publish-post-from-plan")
-async def publish_post_from_plan(request: PublishFromPlanRequest):
-    posts = user_data.get("posts", [])
-    if request.index >= len(posts):
-        return JSONResponse(content={"message": "❌ Пост не найден"})
-    post = posts[request.index]
-    result = publish_to_vk_wall(post["text"], post.get("image_url"), request.vk_token, request.group_id)
-    if "✅" in result:
-        user_data["posts"].pop(request.index)
-        save_user_data(user_data)
-        return JSONResponse(content={"message": result, "success": True})
-    return JSONResponse(content={"message": result, "success": False})
+async def publish_post_from_plan(req: PublishFromPlanRequest, request: Request, response: Response):
+    user_id = _get_user_id(request)
+    response.set_cookie(key="bis_user_id", value=user_id, max_age=60 * 60 * 24 * 365, httponly=True, samesite="lax")
+    db = SessionLocal()
+    try:
+        post = _db_get_post_by_index(db, user_id, req.index)
+        if not post:
+            return JSONResponse(content={"message": "❌ Пост не найден", "success": False})
+        result = publish_to_vk_wall(post.text, post.image_url, req.vk_token, req.group_id)
+        if "✅" in result:
+            db.delete(post)
+            db.commit()
+            return JSONResponse(content={"message": result, "success": True})
+        return JSONResponse(content={"message": result, "success": False})
+    finally:
+        db.close()
 
 
 @app.post("/api/delete-post")
-async def delete_post(request: DeletePostRequest):
-    posts = user_data.get("posts", [])
-    if request.index < len(posts):
-        user_data["posts"].pop(request.index)
-        save_user_data(user_data)
+async def delete_post(req: DeletePostRequest, request: Request, response: Response):
+    user_id = _get_user_id(request)
+    response.set_cookie(key="bis_user_id", value=user_id, max_age=60 * 60 * 24 * 365, httponly=True, samesite="lax")
+    db = SessionLocal()
+    try:
+        deleted = _db_delete_post_by_index(db, user_id, req.index)
+    finally:
+        db.close()
+    if deleted:
         return JSONResponse(content={"message": "✅ Пост удалён"})
     return JSONResponse(content={"message": "❌ Пост не найден"})
 
 
 @app.post("/api/publish-to-vk")
-async def publish_to_vk(request: PublishRequest):
-    if not request.vk_token:
+async def publish_to_vk(req: PublishRequest):
+    if not req.vk_token:
         return JSONResponse(content={"message": "❌ VK токен не указан. Добавьте его в настройках аккаунта."})
-    if not request.group_id:
+    if not req.group_id:
         return JSONResponse(content={"message": "❌ ID группы не указан. Добавьте его в настройках аккаунта."})
-    result = publish_to_vk_wall(request.text, request.image_url, request.vk_token, request.group_id)
+    result = publish_to_vk_wall(req.text, req.image_url, req.vk_token, req.group_id)
     return JSONResponse(content={"message": result})
 
 
 @app.post("/api/save-profile")
-async def save_profile(request: Request):
+async def save_profile(request: Request, response: Response):
+    user_id = _get_user_id(request)
+    response.set_cookie(key="bis_user_id", value=user_id, max_age=60 * 60 * 24 * 365, httponly=True, samesite="lax")
     data = await request.json()
-    user_data["profile"] = data
-    save_user_data(user_data)
+    db = SessionLocal()
+    try:
+        _db_save_profile(db, user_id, data)
+    finally:
+        db.close()
     return JSONResponse(content={"message": "✅ Настройки сохранены!"})
 
 
 @app.get("/api/get-profile")
-async def get_profile():
-    return JSONResponse(content=user_data.get("profile", {}))
+async def get_profile(request: Request, response: Response):
+    user_id = _get_user_id(request)
+    response.set_cookie(key="bis_user_id", value=user_id, max_age=60 * 60 * 24 * 365, httponly=True, samesite="lax")
+    db = SessionLocal()
+    try:
+        profile = _db_get_profile(db, user_id)
+    finally:
+        db.close()
+    return JSONResponse(content=profile)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -725,4 +896,4 @@ async def feedback():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
