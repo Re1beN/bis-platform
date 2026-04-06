@@ -6,6 +6,7 @@ import uuid
 import json
 import os
 import random
+from datetime import datetime
 
 app = FastAPI(title="БИС Platform")
 
@@ -34,6 +35,9 @@ def save_user_data(data):
 
 
 user_data = load_user_data()
+if "posts" not in user_data:
+    user_data["posts"] = []
+    save_user_data(user_data)
 
 
 # ========== GIGACHAT ==========
@@ -107,63 +111,73 @@ def call_gigachat(prompt, user_profile=None):
         return f"❌ Ошибка: {str(e)}"
 
 
-# ========== ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ ЧЕРЕЗ API ==========
-def search_pexels(query):
-    url = f"https://api.pexels.com/v1/search?query={query}&per_page=3"
-    headers = {"Authorization": PEXELS_API_KEY}
+# ========== ПОИСК ФОТО ==========
+def search_image(query):
     try:
-        response = requests.get(url, headers=headers, timeout=10)
-        print(f"[Pexels] Статус: {response.status_code}")
-        if response.status_code == 200:
-            data = response.json()
-            photos = data.get('photos', [])
-            if photos:
-                return photos[0]['src']['medium']
-        return None
-    except Exception as e:
-        print(f"[Pexels] Ошибка: {e}")
-        return None
-
-
-def search_unsplash(query):
-    url = f"https://api.unsplash.com/search/photos?query={query}&per_page=1&client_id={UNSPLASH_API_KEY}"
+        r = requests.get(
+            f"https://api.unsplash.com/search/photos?query={query}&per_page=1&client_id={UNSPLASH_API_KEY}", timeout=10)
+        if r.status_code == 200 and r.json().get('results'):
+            return r.json()['results'][0]['urls']['regular']
+    except:
+        pass
     try:
-        response = requests.get(url, timeout=10)
-        print(f"[Unsplash] Статус: {response.status_code}")
-        if response.status_code == 200:
-            data = response.json()
-            results = data.get('results', [])
-            if results:
-                return results[0]['urls']['regular']
-        return None
+        r = requests.get(f"https://api.pexels.com/v1/search?query={query}&per_page=1",
+                         headers={"Authorization": PEXELS_API_KEY}, timeout=10)
+        if r.status_code == 200 and r.json().get('photos'):
+            return r.json()['photos'][0]['src']['medium']
+    except:
+        pass
+    return None
+
+
+# ========== АВТОПОСТИНГ В VK ==========
+def publish_to_vk_wall(text, image_url, vk_token, group_id):
+    if not vk_token:
+        return "❌ VK токен не указан. Добавьте его в настройках аккаунта."
+
+    params = {
+        "owner_id": -int(group_id),
+        "message": text,
+        "access_token": vk_token,
+        "v": "5.199"
+    }
+
+    if image_url:
+        try:
+            img_data = requests.get(image_url, timeout=30).content
+            upload_server_resp = requests.get("https://api.vk.com/method/photos.getWallUploadServer",
+                                              params={"group_id": group_id, "access_token": vk_token,
+                                                      "v": "5.199"}).json()
+            if "response" in upload_server_resp:
+                upload_url = upload_server_resp["response"]["upload_url"]
+                files = {"photo": ("image.jpg", img_data, "image/jpeg")}
+                upload_result = requests.post(upload_url, files=files).json()
+                save_params = {
+                    "group_id": group_id,
+                    "photo": upload_result["photo"],
+                    "server": upload_result["server"],
+                    "hash": upload_result["hash"],
+                    "access_token": vk_token,
+                    "v": "5.199"
+                }
+                save_resp = requests.get("https://api.vk.com/method/photos.saveWallPhoto", params=save_params).json()
+                if "response" in save_resp:
+                    photo = save_resp["response"][0]
+                    params["attachments"] = f"photo{photo['owner_id']}_{photo['id']}"
+        except Exception as e:
+            print(f"Ошибка загрузки фото: {e}")
+
+    try:
+        response = requests.post("https://api.vk.com/method/wall.post", data=params)
+        result = response.json()
+        if "error" in result:
+            return f"❌ Ошибка VK: {result['error']['error_msg']}"
+        return f"✅ Пост опубликован! ID: {result['response']['post_id']}"
     except Exception as e:
-        print(f"[Unsplash] Ошибка: {e}")
-        return None
+        return f"❌ Ошибка: {str(e)}"
 
 
-@app.get("/api/generate-image")
-async def generate_image(prompt: str):
-    # 1. Пробуем Pexels
-    image_url = search_pexels(prompt)
-
-    # 2. Если Pexels не сработал — пробуем Unsplash
-    if not image_url:
-        image_url = search_unsplash(prompt)
-
-    # 3. Если оба API не сработали — демо-режим
-    if not image_url:
-        demo_images = [
-            "https://images.pexels.com/photos/417074/pexels-photo-417074.jpeg?w=600",
-            "https://images.pexels.com/photos/459225/pexels-photo-459225.jpeg?w=600",
-            "https://images.pexels.com/photos/355465/pexels-photo-355465.jpeg?w=600",
-        ]
-        image_url = random.choice(demo_images)
-        print("[Demo] Использую демо-фото")
-
-    return JSONResponse(content={"url": image_url})
-
-
-# ========== ЕДИНЫЙ СТИЛЬ ==========
+# ========== HTML СТРАНИЦЫ ==========
 COMMON_STYLES = """
 <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -173,26 +187,9 @@ COMMON_STYLES = """
         color: #fff;
         min-height: 100vh;
     }
-    .stars {
-        position: fixed;
-        top: 0;
-        left: 0;
-        width: 100%;
-        height: 100%;
-        pointer-events: none;
-        z-index: 0;
-    }
-    .star {
-        position: absolute;
-        background-color: #fff;
-        border-radius: 50%;
-        opacity: 0;
-        animation: twinkle 3s infinite;
-    }
-    @keyframes twinkle {
-        0%, 100% { opacity: 0; }
-        50% { opacity: 0.8; }
-    }
+    .stars { position: fixed; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 0; }
+    .star { position: absolute; background-color: #fff; border-radius: 50%; opacity: 0; animation: twinkle 3s infinite; }
+    @keyframes twinkle { 0%, 100% { opacity: 0; } 50% { opacity: 0.8; } }
     .content { position: relative; z-index: 10; min-height: 100vh; display: flex; flex-direction: column; }
     .header {
         display: flex;
@@ -203,194 +200,56 @@ COMMON_STYLES = """
         backdrop-filter: blur(10px);
         border-bottom: 1px solid rgba(255,102,0,0.3);
     }
-    .logo {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-    }
-    .logo-icon {
-        width: 36px;
-        height: 36px;
-        background: linear-gradient(135deg, #ff6600, #ffaa00);
-        border-radius: 50%;
-        box-shadow: 0 0 15px #ff6600;
-    }
-    .logo-text {
-        font-size: 20px;
-        font-weight: 700;
-        background: linear-gradient(135deg, #ff6600, #ffaa00);
-        -webkit-background-clip: text;
-        background-clip: text;
-        color: transparent;
-    }
+    .logo { display: flex; align-items: center; gap: 12px; }
+    .logo-icon { width: 36px; height: 36px; background: linear-gradient(135deg, #ff6600, #ffaa00); border-radius: 50%; box-shadow: 0 0 15px #ff6600; }
+    .logo-text { font-size: 20px; font-weight: 700; background: linear-gradient(135deg, #ff6600, #ffaa00); -webkit-background-clip: text; background-clip: text; color: transparent; }
     .nav-menu { display: flex; gap: 32px; }
     .nav-menu a { color: #fff; text-decoration: none; font-size: 14px; opacity: 0.8; transition: 0.3s; }
     .nav-menu a:hover { opacity: 1; color: #ff6600; }
     .nav-right { display: flex; gap: 24px; align-items: center; }
-    .lang-switch {
-        display: flex;
-        gap: 6px;
-        background: rgba(26,26,26,0.8);
-        padding: 4px 8px;
-        border-radius: 20px;
-    }
+    .lang-switch { display: flex; gap: 6px; background: rgba(26,26,26,0.8); padding: 4px 8px; border-radius: 20px; }
     .lang-switch span { cursor: pointer; font-size: 12px; color: #888; }
     .lang-switch span.active { color: #ff6600; }
     .main-container { flex: 1; padding: 40px 48px; }
-    h1 {
-        font-size: 32px;
-        font-weight: 700;
-        margin-bottom: 30px;
-        background: linear-gradient(135deg, #fff, #ffaa00);
-        -webkit-background-clip: text;
-        background-clip: text;
-        color: transparent;
-    }
+    h1 { font-size: 32px; font-weight: 700; margin-bottom: 30px; background: linear-gradient(135deg, #fff, #ffaa00); -webkit-background-clip: text; background-clip: text; color: transparent; }
     h2 { font-size: 22px; font-weight: 600; margin-bottom: 20px; color: #ffaa00; }
-    .card {
-        background: rgba(20,20,30,0.7);
-        backdrop-filter: blur(10px);
-        border-radius: 20px;
-        padding: 24px;
-        margin-bottom: 24px;
-        border: 1px solid rgba(255,102,0,0.2);
-    }
-    .btn-primary {
-        background: linear-gradient(135deg, #ff6600, #ffaa00);
-        color: #000;
-        padding: 12px 28px;
-        border-radius: 30px;
-        font-size: 14px;
-        font-weight: 600;
-        border: none;
-        cursor: pointer;
-        transition: 0.3s;
-    }
+    .card { background: rgba(20,20,30,0.7); backdrop-filter: blur(10px); border-radius: 20px; padding: 24px; margin-bottom: 24px; border: 1px solid rgba(255,102,0,0.2); }
+    .btn-primary { background: linear-gradient(135deg, #ff6600, #ffaa00); color: #000; padding: 12px 28px; border-radius: 30px; font-size: 14px; font-weight: 600; border: none; cursor: pointer; transition: 0.3s; }
     .btn-primary:hover { transform: scale(1.02); box-shadow: 0 0 20px rgba(255,102,0,0.5); }
-    .btn-secondary {
-        background: transparent;
-        border: 1px solid #ff6600;
-        color: #ff6600;
-        padding: 10px 24px;
-        border-radius: 30px;
-        cursor: pointer;
-        transition: 0.3s;
-    }
+    .btn-secondary { background: transparent; border: 1px solid #ff6600; color: #ff6600; padding: 10px 24px; border-radius: 30px; cursor: pointer; transition: 0.3s; }
     .btn-secondary:hover { background: rgba(255,102,0,0.2); }
-    .footer {
-        text-align: center;
-        padding: 30px;
-        border-top: 1px solid #222;
-        font-size: 12px;
-        color: #666;
-    }
+    .footer { text-align: center; padding: 30px; border-top: 1px solid #222; font-size: 12px; color: #666; }
     .workspace-layout { display: flex; gap: 30px; }
-    .left-panel, .right-panel {
-        background: rgba(20,20,30,0.7);
-        backdrop-filter: blur(10px);
-        border-radius: 20px;
-        padding: 24px;
-        border: 1px solid rgba(255,102,0,0.2);
-    }
+    .left-panel, .right-panel { background: rgba(20,20,30,0.7); backdrop-filter: blur(10px); border-radius: 20px; padding: 24px; border: 1px solid rgba(255,102,0,0.2); }
     .left-panel { flex: 1; }
     .right-panel { flex: 1.5; }
     .format-buttons { display: flex; gap: 15px; margin: 20px 0; }
-    .format-btn {
-        background: rgba(50,50,60,0.5);
-        border: 1px solid #444;
-        border-radius: 30px;
-        padding: 10px 24px;
-        cursor: pointer;
-        color: #fff;
-    }
+    .format-btn { background: rgba(50,50,60,0.5); border: 1px solid #444; border-radius: 30px; padding: 10px 24px; cursor: pointer; color: #fff; }
     .format-btn.active { background: #ff6600; border-color: #ff6600; color: #000; }
-    .result-area {
-        background: rgba(0,0,0,0.5);
-        border-radius: 16px;
-        padding: 20px;
-        margin-top: 20px;
-        border: 1px solid #333;
-        min-height: 300px;
-    }
+    .result-area { background: rgba(0,0,0,0.5); border-radius: 16px; padding: 20px; margin-top: 20px; border: 1px solid #333; min-height: 300px; }
     .checkbox-group { display: flex; gap: 20px; margin: 15px 0; flex-wrap: wrap; }
     .checkbox-group label { display: flex; align-items: center; gap: 8px; color: #ddd; }
-    textarea {
-        width: 100%;
-        background: rgba(30,30,40,0.8);
-        border: 1px solid #333;
-        border-radius: 12px;
-        padding: 12px;
-        color: #fff;
-        margin: 15px 0;
-    }
-    .workspace-nav {
-        display: flex;
-        gap: 20px;
-        margin-bottom: 25px;
-        border-bottom: 1px solid #333;
-        padding-bottom: 15px;
-    }
-    .workspace-nav a {
-        color: #aaa;
-        text-decoration: none;
-        padding: 8px 16px;
-        border-radius: 20px;
-        cursor: pointer;
-    }
-    .workspace-nav a:hover, .workspace-nav a.active {
-        background: rgba(255,102,0,0.2);
-        color: #ff6600;
-    }
+    textarea { width: 100%; background: rgba(30,30,40,0.8); border: 1px solid #333; border-radius: 12px; padding: 12px; color: #fff; margin: 15px 0; }
+    .workspace-nav { display: flex; gap: 20px; margin-bottom: 25px; border-bottom: 1px solid #333; padding-bottom: 15px; }
+    .workspace-nav a { color: #aaa; text-decoration: none; padding: 8px 16px; border-radius: 20px; cursor: pointer; }
+    .workspace-nav a:hover, .workspace-nav a.active { background: rgba(255,102,0,0.2); color: #ff6600; }
     .form-group { margin-bottom: 15px; }
     .form-group label { display: block; margin-bottom: 5px; color: #ffaa00; font-size: 14px; }
-    .form-group input, .form-group select {
-        width: 100%;
-        padding: 10px;
-        background: rgba(30,30,40,0.8);
-        border: 1px solid #333;
-        border-radius: 8px;
-        color: #fff;
+    .form-group input, .form-group select { width: 100%; padding: 10px; background: rgba(30,30,40,0.8); border: 1px solid #333; border-radius: 8px; color: #fff; }
+    .post-item {
+        background: rgba(30,30,40,0.5);
+        border-radius: 12px;
+        padding: 15px;
+        margin-bottom: 15px;
+        border: 1px solid #444;
     }
-    .photo-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
-        gap: 10px;
-        margin-top: 15px;
-    }
-    .photo-item { cursor: pointer; border-radius: 8px; overflow: hidden; }
-    .photo-item img { width: 100%; height: 80px; object-fit: cover; }
-    .pricing-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-        gap: 30px;
-        margin-top: 30px;
-    }
-    .pricing-card {
-        background: rgba(20,20,30,0.8);
-        backdrop-filter: blur(10px);
-        border-radius: 24px;
-        padding: 32px;
-        text-align: center;
-        border: 1px solid rgba(255,102,0,0.3);
-    }
-    .pricing-card h3 { font-size: 24px; }
-    .price { font-size: 42px; font-weight: 800; color: #ffaa00; margin: 20px 0; }
-    .price span { font-size: 16px; font-weight: 400; color: #888; }
-    .features-list { list-style: none; margin: 20px 0; }
-    .features-list li { padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,0.1); }
-    .contact-info { text-align: center; margin-top: 20px; }
-    .contact-item {
-        display: inline-block;
-        margin: 10px 20px;
-        padding: 10px 20px;
-        background: rgba(255,102,0,0.1);
-        border-radius: 30px;
-    }
-    .contact-item a { color: #ffaa00; text-decoration: none; }
+    .post-text { color: #ddd; margin-bottom: 10px; font-size: 14px; }
+    .post-actions { display: flex; gap: 10px; }
+    .post-actions button { padding: 5px 12px; font-size: 12px; }
+    .empty-plan { text-align: center; padding: 40px; color: #888; }
 </style>
 """
 
-# ========== HTML СТРАНИЦЫ ==========
 LANDING_PAGE = """
 <!DOCTYPE html>
 <html>
@@ -557,8 +416,8 @@ WORKSPACE_PAGE = """
                     <textarea id="topicInput" rows="3" placeholder="Напишите тему поста... например: Напиши пост про Москву!"></textarea>
                     <div style="display:flex;gap:15px;flex-wrap:wrap;">
                         <button class="btn-primary" onclick="generatePost()">✨ Сгенерировать</button>
-                        <button class="btn-secondary" onclick="generateImage()">🎨 Сгенерировать изображение</button>
-                        <button class="btn-secondary" onclick="publishToVK()">📤 Опубликовать в VK</button>
+                        <button class="btn-secondary" onclick="generateImage()">🎨 Найти изображение</button>
+                        <button class="btn-secondary" onclick="addToPlan()">📅 Добавить в контент-план</button>
                     </div>
                     <div id="imageResult" class="result-area" style="display:none; margin-top:20px;"></div>
                 </div>
@@ -566,23 +425,29 @@ WORKSPACE_PAGE = """
                     <h2>Результат</h2>
                     <div class="result-area" id="resultContent"><p id="resultText" style="color:#aaa;">Здесь появится результат...</p></div>
                     <div style="display:flex;gap:15px;margin-top:20px;">
-                        <button class="btn-secondary" onclick="addToPlan()">📅 Добавить в контент-план</button>
                         <button class="btn-secondary" onclick="regenerate()">🔄 Другой вариант</button>
                     </div>
                 </div>
             </div>
         </div>
-        <div id="plan-section" style="display:none;"><div class="card" style="text-align:center;"><h2>📅 Контент-план</h2><p style="margin:20px 0;">Здесь будет контент-план на неделю</p><button class="btn-primary" onclick="switchSection('studio')">➕ Добавить пост</button></div></div>
+        <div id="plan-section" style="display:none;">
+            <div class="card">
+                <h2>📅 Контент-план</h2>
+                <div id="postsList"></div>
+            </div>
+        </div>
         <div id="analytics-section" style="display:none;"><div class="card" style="text-align:center;"><h2>📊 Аналитика</h2><p style="margin:20px 0;">Здесь будут метрики и AI-гипотезы</p><button class="btn-secondary" onclick="switchSection('studio')">Вернуться</button></div></div>
         <div id="settings-section" style="display:none;">
-            <div class="card"><h2>⚙️ Настройки профиля бренда</h2>
+            <div class="card"><h2>⚙️ Настройки аккаунта</h2>
             <form id="profileForm">
                 <div class="form-group"><label>🏢 Ниша</label><input type="text" id="niche" placeholder="туризм по Томску"></div>
                 <div class="form-group"><label>🎭 Тональность</label><input type="text" id="tone" placeholder="вдохновляющий и экспертный"></div>
                 <div class="form-group"><label>🏙️ Город</label><input type="text" id="city" placeholder="Томск"></div>
                 <div class="form-group"><label>🎯 Цель бренда</label><select id="goal"><option value="expert">🎓 Эксперт</option><option value="influencer">⭐ Лидер мнений</option><option value="sales">💰 Продажи</option></select></div>
-                <button type="button" class="btn-primary" onclick="saveProfile()">💾 Сохранить профиль</button>
-                <button type="button" class="btn-secondary" onclick="loadProfile()">🔄 Загрузить профиль</button>
+                <div class="form-group"><label>🔑 VK Access Token (права wall)</label><input type="text" id="vk_token" placeholder="vk1.a.xxxx... получите на vkhost.github.io"></div>
+                <div class="form-group"><label>📱 ID группы VK</label><input type="text" id="group_id" placeholder="237128228"></div>
+                <button type="button" class="btn-primary" onclick="saveProfile()">💾 Сохранить настройки</button>
+                <button type="button" class="btn-secondary" onclick="loadProfile()">🔄 Загрузить настройки</button>
             </form>
             <div id="profileStatus" style="margin-top:20px;color:#ffaa00;"></div>
             </div>
@@ -591,7 +456,7 @@ WORKSPACE_PAGE = """
     <div class="footer"><p>© 2026 БИС — Бренд. Имидж. Стратегия.</p></div>
 </div>
 <script>
-    let currentFormat = 'post', currentText = '';
+    let currentFormat = 'post', currentText = '', currentImageUrl = '';
     function createStars(){for(let i=0;i<200;i++){let s=document.createElement('div');s.classList.add('star');s.style.cssText=`width:${Math.random()*2+1}px;height:${Math.random()*2+1}px;left:${Math.random()*100}%;top:${Math.random()*100}%;animation-delay:${Math.random()*5}s`;document.getElementById('stars').appendChild(s);}}
     createStars();
     function selectFormat(f){currentFormat=f;document.querySelectorAll('.format-btn').forEach(b=>b.classList.remove('active'));event.target.classList.add('active');}
@@ -608,38 +473,121 @@ WORKSPACE_PAGE = """
     }
     async function generateImage(){
         let topic=document.getElementById('topicInput').value;
-        if(!topic){alert('Введите тему для генерации изображения');return;}
+        if(!topic){alert('Введите тему');return;}
         let imageDiv=document.getElementById('imageResult');
         imageDiv.style.display='block';
-        imageDiv.innerHTML='🎨 Поиск изображения по запросу...';
+        imageDiv.innerHTML='🎨 Поиск...';
         try{
             let resp=await fetch(`/api/generate-image?prompt=${encodeURIComponent(topic)}`);
+            if(resp.status==404){imageDiv.innerHTML='❌ Не найдено';return;}
             let data=await resp.json();
-            if(data.url){imageDiv.innerHTML=`<img src="${data.url}" style="max-width:100%;border-radius:12px;">`;}
-            else{imageDiv.innerHTML='❌ Не удалось найти изображение';}
-        }catch(e){imageDiv.innerHTML='❌ Ошибка поиска';}
+            currentImageUrl=data.url;
+            imageDiv.innerHTML=`<img src="${data.url}" style="max-width:100%;border-radius:12px;">`;
+        }catch(e){imageDiv.innerHTML='❌ Ошибка';}
     }
-    async function publishToVK(){if(!currentText){alert('Сначала сгенерируйте пост');return;}if(confirm('Опубликовать в VK?')){let resp=await fetch('/api/publish-to-vk',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:currentText})});let data=await resp.json();alert(data.message);}}
+    async function addToPlan(){
+        if(!currentText){alert('Сначала сгенерируйте пост');return;}
+        let postData = {
+            text: currentText,
+            image_url: currentImageUrl,
+            date: new Date().toLocaleString()
+        };
+        let resp=await fetch('/api/add-to-plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(postData)});
+        let data=await resp.json();
+        alert(data.message);
+        if(switchSection) loadPosts();
+    }
+    async function loadPosts(){
+        let resp=await fetch('/api/get-posts');
+        let posts=await resp.json();
+        let container=document.getElementById('postsList');
+        if(!posts.length){
+            container.innerHTML='<div class="empty-plan">📭 Нет добавленных постов. Создайте пост в Контент-студии и нажмите "Добавить в контент-план"</div>';
+            return;
+        }
+        container.innerHTML=posts.map((p,i)=>`
+            <div class="post-item">
+                <div class="post-text">${p.text.substring(0,300)}${p.text.length>300?'...':''}</div>
+                ${p.image_url ? `<img src="${p.image_url}" style="max-width:100%;border-radius:12px;margin-bottom:10px;">` : ''}
+                <div class="post-actions">
+                    <button class="btn-secondary" onclick="publishPost(${i})">📤 Опубликовать</button>
+                    <button class="btn-secondary" onclick="deletePost(${i})">🗑️ Удалить</button>
+                </div>
+            </div>
+        `).join('');
+    }
+    async function publishPost(index){
+        let vk_token=document.getElementById('vk_token').value;
+        let group_id=document.getElementById('group_id').value;
+        if(!vk_token || !group_id){
+            alert('❌ Сначала укажите VK токен и ID группы в настройках аккаунта');
+            return;
+        }
+        let resp=await fetch('/api/publish-post-from-plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:index, vk_token:vk_token, group_id:group_id})});
+        let data=await resp.json();
+        alert(data.message);
+        if(data.success) loadPosts();
+    }
+    async function deletePost(index){
+        if(confirm('Удалить пост из контент-плана?')){
+            let resp=await fetch('/api/delete-post',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:index})});
+            let data=await resp.json();
+            alert(data.message);
+            loadPosts();
+        }
+    }
+    async function publishToVK(){
+        if(!currentText){alert('Сначала сгенерируйте пост');return;}
+        let vk_token=document.getElementById('vk_token').value;
+        let group_id=document.getElementById('group_id').value;
+        if(!vk_token || !group_id){
+            alert('❌ Сначала укажите VK токен и ID группы в настройках аккаунта');
+            return;
+        }
+        let btn=event.target;
+        btn.innerText='⏳ Публикация...';
+        btn.disabled=true;
+        let resp=await fetch('/api/publish-to-vk',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:currentText, image_url:currentImageUrl, vk_token:vk_token, group_id:group_id})});
+        let data=await resp.json();
+        alert(data.message);
+        btn.innerText='📤 Опубликовать в VK';
+        btn.disabled=false;
+    }
     function regenerate(){generatePost();}
-    function addToPlan(){alert('✅ Добавлено в план!');}
     function switchSection(s){
-        document.getElementById('studio-section').style.display='none';document.getElementById('plan-section').style.display='none';document.getElementById('analytics-section').style.display='none';document.getElementById('settings-section').style.display='none';
-        if(s==='studio')document.getElementById('studio-section').style.display='block';
-        else if(s==='plan')document.getElementById('plan-section').style.display='block';
-        else if(s==='analytics')document.getElementById('analytics-section').style.display='block';
-        else if(s==='settings')document.getElementById('settings-section').style.display='block';
-        document.querySelectorAll('.workspace-nav a').forEach(l=>l.classList.remove('active'));event.target.classList.add('active');
-        if(s==='settings')loadProfile();
+        document.getElementById('studio-section').style.display='none';
+        document.getElementById('plan-section').style.display='none';
+        document.getElementById('analytics-section').style.display='none';
+        document.getElementById('settings-section').style.display='none';
+        if(s==='studio') document.getElementById('studio-section').style.display='block';
+        else if(s==='plan'){
+            document.getElementById('plan-section').style.display='block';
+            loadPosts();
+        }
+        else if(s==='analytics') document.getElementById('analytics-section').style.display='block';
+        else if(s==='settings') document.getElementById('settings-section').style.display='block';
+        document.querySelectorAll('.workspace-nav a').forEach(l=>l.classList.remove('active'));
+        event.target.classList.add('active');
+        if(s==='settings') loadProfile();
     }
     async function saveProfile(){
-        let profile={niche:document.getElementById('niche').value,tone:document.getElementById('tone').value,city:document.getElementById('city').value,goal:document.getElementById('goal').value};
+        let profile={niche:document.getElementById('niche').value,tone:document.getElementById('tone').value,city:document.getElementById('city').value,goal:document.getElementById('goal').value,vk_token:document.getElementById('vk_token').value,group_id:document.getElementById('group_id').value};
         let resp=await fetch('/api/save-profile',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(profile)});
-        let data=await resp.json();document.getElementById('profileStatus').innerHTML=data.message;setTimeout(()=>document.getElementById('profileStatus').innerHTML='',3000);
+        let data=await resp.json();
+        document.getElementById('profileStatus').innerHTML=data.message;
+        setTimeout(()=>document.getElementById('profileStatus').innerHTML='',3000);
     }
     async function loadProfile(){
-        let resp=await fetch('/api/get-profile');let profile=await resp.json();
-        document.getElementById('niche').value=profile.niche||'';document.getElementById('tone').value=profile.tone||'';document.getElementById('city').value=profile.city||'';document.getElementById('goal').value=profile.goal||'expert';
-        document.getElementById('profileStatus').innerHTML='✅ Профиль загружен';setTimeout(()=>document.getElementById('profileStatus').innerHTML='',2000);
+        let resp=await fetch('/api/get-profile');
+        let profile=await resp.json();
+        document.getElementById('niche').value=profile.niche||'';
+        document.getElementById('tone').value=profile.tone||'';
+        document.getElementById('city').value=profile.city||'';
+        document.getElementById('goal').value=profile.goal||'expert';
+        document.getElementById('vk_token').value=profile.vk_token||'';
+        document.getElementById('group_id').value=profile.group_id||'';
+        document.getElementById('profileStatus').innerHTML='✅ Настройки загружены';
+        setTimeout(()=>document.getElementById('profileStatus').innerHTML='',2000);
     }
 </script>
 </body>
@@ -653,6 +601,29 @@ class GenerateRequest(BaseModel):
     prompt: str
 
 
+class PublishRequest(BaseModel):
+    text: str
+    image_url: str = None
+    vk_token: str = None
+    group_id: str = None
+
+
+class AddPostRequest(BaseModel):
+    text: str
+    image_url: str = None
+    date: str = None
+
+
+class PublishFromPlanRequest(BaseModel):
+    index: int
+    vk_token: str
+    group_id: str
+
+
+class DeletePostRequest(BaseModel):
+    index: int
+
+
 @app.post("/api/generate")
 async def generate(request: GenerateRequest):
     profile = user_data.get("profile", {})
@@ -660,12 +631,64 @@ async def generate(request: GenerateRequest):
     return JSONResponse(content={"result": result})
 
 
+@app.get("/api/generate-image")
+async def generate_image(prompt: str):
+    url = search_image(prompt)
+    if not url:
+        return JSONResponse(content={"error": "Не найдено"}, status_code=404)
+    return JSONResponse(content={"url": url})
+
+
+@app.post("/api/add-to-plan")
+async def add_to_plan(request: AddPostRequest):
+    if "posts" not in user_data:
+        user_data["posts"] = []
+    user_data["posts"].append({
+        "text": request.text,
+        "image_url": request.image_url,
+        "date": request.date or datetime.now().strftime("%Y-%m-%d %H:%M")
+    })
+    save_user_data(user_data)
+    return JSONResponse(content={"message": "✅ Пост добавлен в контент-план!"})
+
+
+@app.get("/api/get-posts")
+async def get_posts():
+    return JSONResponse(content=user_data.get("posts", []))
+
+
+@app.post("/api/publish-post-from-plan")
+async def publish_post_from_plan(request: PublishFromPlanRequest):
+    posts = user_data.get("posts", [])
+    if request.index >= len(posts):
+        return JSONResponse(content={"message": "❌ Пост не найден"})
+    post = posts[request.index]
+    result = publish_to_vk_wall(post["text"], post.get("image_url"), request.vk_token, request.group_id)
+    if "✅" in result:
+        user_data["posts"].pop(request.index)
+        save_user_data(user_data)
+        return JSONResponse(content={"message": result, "success": True})
+    return JSONResponse(content={"message": result, "success": False})
+
+
+@app.post("/api/delete-post")
+async def delete_post(request: DeletePostRequest):
+    posts = user_data.get("posts", [])
+    if request.index < len(posts):
+        user_data["posts"].pop(request.index)
+        save_user_data(user_data)
+        return JSONResponse(content={"message": "✅ Пост удалён"})
+    return JSONResponse(content={"message": "❌ Пост не найден"})
+
+
 @app.post("/api/publish-to-vk")
-async def publish_to_vk(request: Request):
-    data = await request.json()
-    text = data.get("text", "")
-    return JSONResponse(
-        content={"message": "✅ Пост отправлен в VK (демо-режим). Для реальной публикации настройте VK API."})
+async def publish_to_vk(request: PublishRequest):
+    if not request.vk_token:
+        return JSONResponse(content={"message": "❌ VK токен не указан. Добавьте его в настройках аккаунта."})
+    if not request.group_id:
+        return JSONResponse(content={"message": "❌ ID группы не указан. Добавьте его в настройках аккаунта."})
+    result = publish_to_vk_wall(request.text, request.image_url, request.vk_token, request.group_id)
+    return JSONResponse(content={"message": result})
 
 
 @app.post("/api/save-profile")
@@ -673,7 +696,7 @@ async def save_profile(request: Request):
     data = await request.json()
     user_data["profile"] = data
     save_user_data(user_data)
-    return JSONResponse(content={"message": "✅ Профиль сохранён!"})
+    return JSONResponse(content={"message": "✅ Настройки сохранены!"})
 
 
 @app.get("/api/get-profile")
