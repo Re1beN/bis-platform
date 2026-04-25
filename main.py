@@ -1,7 +1,8 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 import uvicorn
 import requests
+import aiohttp
 import uuid
 import json
 import os
@@ -15,6 +16,11 @@ GIGACHAT_AUTH_KEY = "MDE5ZDMzYzItNGY5NS03MGY4LThjOTktYzk5ZDIyMzYyZTk3OmI5OWRhMTV
 PEXELS_API_KEY = "99lzySAP7wyWqzFaBGPQQbcJWPwXZVaR6H6KbILjvJ5Au6iV6YnrxXM5"
 UNSPLASH_API_KEY = "NpF_z6xsa39ov1PS4Bq_AqIoabRJphW1s30RvnOGCMY"
 gigachat_access_token = None
+
+# ========== VK OAUTH ==========
+VK_APP_ID = os.environ.get("VK_APP_ID", "")
+VK_APP_SECRET = os.environ.get("VK_APP_SECRET", "")
+VK_REDIRECT_URI = "https://bis-platform-production.up.railway.app/auth/vk/callback"
 
 USER_DATA_FILE = "user_data.json"
 
@@ -34,9 +40,29 @@ def save_user_data(data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+def get_user_bucket(user_id: str) -> dict:
+    """Return the data bucket for a specific user, creating it if needed."""
+    if "users" not in user_data:
+        user_data["users"] = {}
+    if user_id not in user_data["users"]:
+        user_data["users"][user_id] = {"posts": [], "profile": {}}
+    bucket = user_data["users"][user_id]
+    if "posts" not in bucket:
+        bucket["posts"] = []
+    if "profile" not in bucket:
+        bucket["profile"] = {}
+    return bucket
+
+
+def get_current_user_id(request: Request):
+    """Extract user_id from cookie. Returns None if not authenticated."""
+    return request.cookies.get("bis_user_id")
+
+
 user_data = load_user_data()
-if "posts" not in user_data:
-    user_data["posts"] = []
+# Migrate legacy top-level posts/profile into users dict if present
+if "posts" in user_data and "users" not in user_data:
+    user_data["users"] = {}
     save_user_data(user_data)
 
 
@@ -265,6 +291,16 @@ LANDING_PAGE = """
         .title h1 { font-size: 48px; font-weight: 800; text-transform: uppercase; margin-bottom: 24px; }
         .title h1 span { color: #ff6600; }
         .title p { font-size: 18px; opacity: 0.7; max-width: 700px; margin: 0 auto 30px; }
+        .hero-buttons { display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; }
+        .btn-vk {
+            display: inline-flex; align-items: center; gap: 10px;
+            background: #0077FF; color: #fff;
+            padding: 12px 28px; border-radius: 30px;
+            font-size: 14px; font-weight: 600; text-decoration: none;
+            transition: 0.3s; border: none; cursor: pointer;
+        }
+        .btn-vk:hover { background: #005fcc; box-shadow: 0 0 20px rgba(0,119,255,0.5); transform: scale(1.02); }
+        .btn-vk svg { width: 20px; height: 20px; fill: #fff; flex-shrink: 0; }
     </style>
 </head>
 <body>
@@ -279,9 +315,23 @@ LANDING_PAGE = """
             <a href="/feedback">Обратная связь</a>
             <a href="/tariffs">Тарифы</a>
         </nav>
-        <div class="nav-right"><div class="lang-switch"><span class="active">Lvo</span><span>Ru</span></div></div>
+        <div class="nav-right">
+            <a href="/auth/vk/login" class="btn-vk" style="padding:8px 18px;font-size:13px;">
+                <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12.785 16.241s.288-.032.436-.194c.136-.148.132-.427.132-.427s-.02-1.304.587-1.496c.6-.19 1.37 1.26 2.185 1.817.617.422 1.086.33 1.086.33l2.182-.03s1.14-.071.6-.966c-.044-.073-.314-.661-1.618-1.869-1.366-1.265-1.183-1.06.462-3.246.999-1.33 1.399-2.142 1.274-2.49-.12-.332-.855-.244-.855-.244l-2.455.015s-.182-.025-.317.056c-.132.079-.217.264-.217.264s-.387 1.03-.903 1.905c-1.088 1.847-1.523 1.945-1.7 1.83-.414-.267-.31-1.073-.31-1.646 0-1.79.271-2.535-.528-2.727-.265-.064-.46-.106-1.138-.113-.87-.009-1.606.003-2.022.207-.277.135-.491.437-.361.454.161.021.527.099.72.363.25.341.241 1.107.241 1.107s.144 2.107-.335 2.368c-.329.18-.78-.187-1.748-1.86-.497-.858-.872-1.807-.872-1.807s-.072-.178-.202-.274c-.157-.115-.376-.151-.376-.151l-2.33.015s-.35.01-.479.163c-.114.136-.009.417-.009.417s1.826 4.271 3.893 6.422c1.896 1.973 4.047 1.843 4.047 1.843h.975z"/></svg>
+                Войти через VK
+            </a>
+            <div class="lang-switch"><span class="active">Lvo</span><span>Ru</span></div>
+        </div>
     </header>
-    <div class="hero"><div class="hero-content"><div class="title"><h1>БИС — <span>БРЕНД. ИМИДЖ. СТРАТЕГИЯ.</span><br>ВСЕ НЕОБХОДИМЫЕ НЕЙРОСЕТИ<br>В ОДНОМ МЕСТЕ!</h1><p>Искусственный интеллект нового поколения для работы с текстом, изображениями и данными</p><a href="/workspace" class="btn-primary">Начать работу!</a></div></div></div>
+    <div class="hero"><div class="hero-content"><div class="title"><h1>БИС — <span>БРЕНД. ИМИДЖ. СТРАТЕГИЯ.</span><br>ВСЕ НЕОБХОДИМЫЕ НЕЙРОСЕТИ<br>В ОДНОМ МЕСТЕ!</h1><p>Искусственный интеллект нового поколения для работы с текстом, изображениями и данными</p>
+    <div class="hero-buttons">
+        <a href="/workspace" class="btn-primary">Начать работу!</a>
+        <a href="/auth/vk/login" class="btn-vk">
+            <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12.785 16.241s.288-.032.436-.194c.136-.148.132-.427.132-.427s-.02-1.304.587-1.496c.6-.19 1.37 1.26 2.185 1.817.617.422 1.086.33 1.086.33l2.182-.03s1.14-.071.6-.966c-.044-.073-.314-.661-1.618-1.869-1.366-1.265-1.183-1.06.462-3.246.999-1.33 1.399-2.142 1.274-2.49-.12-.332-.855-.244-.855-.244l-2.455.015s-.182-.025-.317.056c-.132.079-.217.264-.217.264s-.387 1.03-.903 1.905c-1.088 1.847-1.523 1.945-1.7 1.83-.414-.267-.31-1.073-.31-1.646 0-1.79.271-2.535-.528-2.727-.265-.064-.46-.106-1.138-.113-.87-.009-1.606.003-2.022.207-.277.135-.491.437-.361.454.161.021.527.099.72.363.25.341.241 1.107.241 1.107s.144 2.107-.335 2.368c-.329.18-.78-.187-1.748-1.86-.497-.858-.872-1.807-.872-1.807s-.072-.178-.202-.274c-.157-.115-.376-.151-.376-.151l-2.33.015s-.35.01-.479.163c-.114.136-.009.417-.009.417s1.826 4.271 3.893 6.422c1.896 1.973 4.047 1.843 4.047 1.843h.975z"/></svg>
+            Войти через VK
+        </a>
+    </div>
+    </div></div></div>
     <div class="footer"><p>© 2026 БИС — Бренд. Имидж. Стратегия.</p></div>
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
@@ -326,6 +376,7 @@ LANDING_PAGE = """
 """
 
 TARIFFS_PAGE = """
+
 <!DOCTYPE html>
 <html>
 <head><meta charset="UTF-8"><title>БИС — Тарифы</title>""" + COMMON_STYLES + """</head>
@@ -380,8 +431,9 @@ WORKSPACE_PAGE = """
     <header class="header">
         <div class="logo"><div class="logo-icon"></div><span class="logo-text">БИС</span></div>
         <nav class="nav-menu"><a href="/">Главная</a><a href="/workspace">Рабочая зона</a><a href="/feedback">Обратная связь</a><a href="/tariffs">Тарифы</a></nav>
-        <div class="nav-right"><div class="lang-switch"><span class="active">Lvo</span><span>Ru</span></div></div>
+        <div class="nav-right"><a href="/auth/logout" style="color:#ff6600;text-decoration:none;font-size:13px;border:1px solid #ff6600;padding:6px 16px;border-radius:20px;transition:0.3s;" onmouseover="this.style.background='rgba(255,102,0,0.2)'" onmouseout="this.style.background='transparent'">Выйти</a><div class="lang-switch"><span class="active">Lvo</span><span>Ru</span></div></div>
     </header>
+
     <div class="main-container">
         <h1>БИС AI</h1>
         <p style="margin-bottom:30px;opacity:0.8;">Перед общением заполните контент-студию</p>
@@ -391,6 +443,7 @@ WORKSPACE_PAGE = """
             <a onclick="switchSection('analytics')">📊 Аналитика</a>
             <a onclick="switchSection('settings')">⚙️ Настройки аккаунта</a>
         </div>
+
         <div id="studio-section">
             <div class="workspace-layout">
                 <div class="left-panel">
@@ -624,15 +677,139 @@ class DeletePostRequest(BaseModel):
     index: int
 
 
+class ProfileRequest(BaseModel):
+    niche: str = None
+    tone: str = None
+    city: str = None
+    goal: str = None
+    vk_token: str = None
+    group_id: str = None
+
+
+
+# ========== VK OAUTH ENDPOINTS ==========
+
+@app.get("/auth/vk/login")
+async def vk_login():
+    """Redirect user to VK authorization page."""
+    if not VK_APP_ID:
+        return HTMLResponse(content="<h2>Ошибка: VK_APP_ID не настроен</h2>", status_code=500)
+    vk_auth_url = (
+        f"https://oauth.vk.com/authorize"
+        f"?client_id={VK_APP_ID}"
+        f"&display=page"
+        f"&redirect_uri={VK_REDIRECT_URI}"
+        f"&scope=email"
+        f"&response_type=code"
+        f"&v=5.199"
+    )
+    return RedirectResponse(url=vk_auth_url)
+
+
+@app.get("/auth/vk/callback")
+async def vk_callback(request: Request, code: str = None, error: str = None):
+    """Handle VK OAuth callback, create/update user, set cookie, redirect to workspace."""
+    if error or not code:
+        return RedirectResponse(url="/?auth_error=1")
+
+    # Exchange code for access token
+    token_url = "https://oauth.vk.com/access_token"
+    token_params = {
+        "client_id": VK_APP_ID,
+        "client_secret": VK_APP_SECRET,
+        "redirect_uri": VK_REDIRECT_URI,
+        "code": code,
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(token_url, params=token_params) as resp:
+                token_data = await resp.json()
+    except Exception as e:
+        return HTMLResponse(content=f"<h2>Ошибка получения токена: {e}</h2>", status_code=500)
+
+    if "error" in token_data:
+        return RedirectResponse(url="/?auth_error=1")
+
+    vk_access_token = token_data.get("access_token")
+    vk_user_id = str(token_data.get("user_id", ""))
+    vk_email = token_data.get("email", "")
+
+    if not vk_user_id:
+        return RedirectResponse(url="/?auth_error=1")
+
+    # Get user info from VK API
+    try:
+        async with aiohttp.ClientSession() as session:
+            user_info_params = {
+                "user_ids": vk_user_id,
+                "fields": "first_name,last_name,photo_100",
+                "access_token": vk_access_token,
+                "v": "5.199",
+            }
+            async with session.get("https://api.vk.com/method/users.get", params=user_info_params) as resp:
+                user_info_data = await resp.json()
+    except Exception:
+        user_info_data = {}
+
+    vk_user_info = {}
+    if "response" in user_info_data and user_info_data["response"]:
+        vk_user_info = user_info_data["response"][0]
+
+    # Create/update user record in our data store
+    if "users" not in user_data:
+        user_data["users"] = {}
+
+    internal_user_id = f"vk_{vk_user_id}"
+
+    if internal_user_id not in user_data["users"]:
+        user_data["users"][internal_user_id] = {"posts": [], "profile": {}}
+
+    user_data["users"][internal_user_id]["vk_id"] = vk_user_id
+    user_data["users"][internal_user_id]["email"] = vk_email
+    user_data["users"][internal_user_id]["first_name"] = vk_user_info.get("first_name", "")
+    user_data["users"][internal_user_id]["last_name"] = vk_user_info.get("last_name", "")
+    user_data["users"][internal_user_id]["photo"] = vk_user_info.get("photo_100", "")
+    save_user_data(user_data)
+
+    # Set session cookie and redirect to workspace
+    response = RedirectResponse(url="/workspace")
+    response.set_cookie(
+        key="bis_user_id",
+        value=internal_user_id,
+        httponly=True,
+        samesite="lax",
+        max_age=60 * 60 * 24 * 30,  # 30 days
+    )
+    return response
+
+
+@app.get("/auth/logout")
+async def logout():
+    """Clear session cookie and redirect to home."""
+    response = RedirectResponse(url="/")
+    response.delete_cookie(key="bis_user_id")
+    return response
+
+
+# ========== API ENDPOINTS ==========
+
 @app.post("/api/generate")
-async def generate(request: GenerateRequest):
-    profile = user_data.get("profile", {})
-    result = call_gigachat(request.prompt, profile)
+async def generate(request: Request, body: GenerateRequest):
+    user_id = get_current_user_id(request)
+    if not user_id:
+        return JSONResponse(content={"error": "Не авторизован"}, status_code=401)
+    bucket = get_user_bucket(user_id)
+    profile = bucket.get("profile", {})
+    result = call_gigachat(body.prompt, profile)
     return JSONResponse(content={"result": result})
 
 
 @app.get("/api/generate-image")
-async def generate_image(prompt: str):
+async def generate_image(request: Request, prompt: str):
+    user_id = get_current_user_id(request)
+    if not user_id:
+        return JSONResponse(content={"error": "Не авторизован"}, status_code=401)
     url = search_image(prompt)
     if not url:
         return JSONResponse(content={"error": "Не найдено"}, status_code=404)
@@ -640,69 +817,95 @@ async def generate_image(prompt: str):
 
 
 @app.post("/api/add-to-plan")
-async def add_to_plan(request: AddPostRequest):
-    if "posts" not in user_data:
-        user_data["posts"] = []
-    user_data["posts"].append({
-        "text": request.text,
-        "image_url": request.image_url,
-        "date": request.date or datetime.now().strftime("%Y-%m-%d %H:%M")
+async def add_to_plan(request: Request, body: AddPostRequest):
+    user_id = get_current_user_id(request)
+    if not user_id:
+        return JSONResponse(content={"error": "Не авторизован"}, status_code=401)
+    bucket = get_user_bucket(user_id)
+    bucket["posts"].append({
+        "text": body.text,
+        "image_url": body.image_url,
+        "date": body.date or datetime.now().strftime("%Y-%m-%d %H:%M")
     })
     save_user_data(user_data)
     return JSONResponse(content={"message": "✅ Пост добавлен в контент-план!"})
 
 
 @app.get("/api/get-posts")
-async def get_posts():
-    return JSONResponse(content=user_data.get("posts", []))
+async def get_posts(request: Request):
+    user_id = get_current_user_id(request)
+    if not user_id:
+        return JSONResponse(content={"error": "Не авторизован"}, status_code=401)
+    bucket = get_user_bucket(user_id)
+    return JSONResponse(content=bucket.get("posts", []))
 
 
 @app.post("/api/publish-post-from-plan")
-async def publish_post_from_plan(request: PublishFromPlanRequest):
-    posts = user_data.get("posts", [])
-    if request.index >= len(posts):
+async def publish_post_from_plan(request: Request, body: PublishFromPlanRequest):
+    user_id = get_current_user_id(request)
+    if not user_id:
+        return JSONResponse(content={"error": "Не авторизован"}, status_code=401)
+    bucket = get_user_bucket(user_id)
+    posts = bucket.get("posts", [])
+    if body.index >= len(posts):
         return JSONResponse(content={"message": "❌ Пост не найден"})
-    post = posts[request.index]
-    result = publish_to_vk_wall(post["text"], post.get("image_url"), request.vk_token, request.group_id)
+    post = posts[body.index]
+    result = publish_to_vk_wall(post["text"], post.get("image_url"), body.vk_token, body.group_id)
     if "✅" in result:
-        user_data["posts"].pop(request.index)
+        bucket["posts"].pop(body.index)
         save_user_data(user_data)
         return JSONResponse(content={"message": result, "success": True})
     return JSONResponse(content={"message": result, "success": False})
 
 
 @app.post("/api/delete-post")
-async def delete_post(request: DeletePostRequest):
-    posts = user_data.get("posts", [])
-    if request.index < len(posts):
-        user_data["posts"].pop(request.index)
+async def delete_post(request: Request, body: DeletePostRequest):
+    user_id = get_current_user_id(request)
+    if not user_id:
+        return JSONResponse(content={"error": "Не авторизован"}, status_code=401)
+    bucket = get_user_bucket(user_id)
+    posts = bucket.get("posts", [])
+    if body.index < len(posts):
+        bucket["posts"].pop(body.index)
         save_user_data(user_data)
         return JSONResponse(content={"message": "✅ Пост удалён"})
     return JSONResponse(content={"message": "❌ Пост не найден"})
 
 
 @app.post("/api/publish-to-vk")
-async def publish_to_vk(request: PublishRequest):
-    if not request.vk_token:
+async def publish_to_vk(request: Request, body: PublishRequest):
+    user_id = get_current_user_id(request)
+    if not user_id:
+        return JSONResponse(content={"error": "Не авторизован"}, status_code=401)
+    if not body.vk_token:
         return JSONResponse(content={"message": "❌ VK токен не указан. Добавьте его в настройках аккаунта."})
-    if not request.group_id:
+    if not body.group_id:
         return JSONResponse(content={"message": "❌ ID группы не указан. Добавьте его в настройках аккаунта."})
-    result = publish_to_vk_wall(request.text, request.image_url, request.vk_token, request.group_id)
+    result = publish_to_vk_wall(body.text, body.image_url, body.vk_token, body.group_id)
     return JSONResponse(content={"message": result})
 
 
 @app.post("/api/save-profile")
-async def save_profile(request: Request):
-    data = await request.json()
-    user_data["profile"] = data
+async def save_profile(request: Request, body: ProfileRequest):
+    user_id = get_current_user_id(request)
+    if not user_id:
+        return JSONResponse(content={"error": "Не авторизован"}, status_code=401)
+    bucket = get_user_bucket(user_id)
+    bucket["profile"] = body.model_dump(exclude_none=False)
     save_user_data(user_data)
     return JSONResponse(content={"message": "✅ Настройки сохранены!"})
 
 
 @app.get("/api/get-profile")
-async def get_profile():
-    return JSONResponse(content=user_data.get("profile", {}))
+async def get_profile(request: Request):
+    user_id = get_current_user_id(request)
+    if not user_id:
+        return JSONResponse(content={"error": "Не авторизован"}, status_code=401)
+    bucket = get_user_bucket(user_id)
+    return JSONResponse(content=bucket.get("profile", {}))
 
+
+# ========== PAGE ROUTES ==========
 
 @app.get("/", response_class=HTMLResponse)
 async def landing():
@@ -710,7 +913,10 @@ async def landing():
 
 
 @app.get("/workspace", response_class=HTMLResponse)
-async def workspace():
+async def workspace(request: Request):
+    user_id = get_current_user_id(request)
+    if not user_id:
+        return RedirectResponse(url="/auth/vk/login")
     return HTMLResponse(content=WORKSPACE_PAGE)
 
 
