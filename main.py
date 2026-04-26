@@ -26,7 +26,7 @@ gigachat_access_token = None
 
 # ========== VK / OK OAUTH ==========
 VK_APP_ID = "54564776"
-VK_APP_SECRET = "847f95dd847f95dd847f95dd1e873f02758847f847f95dded93634524f95928aba010c9"
+VK_APP_SECRET = "TmmgyUbgiO5FUx7GQ4Mu"
 VK_REDIRECT_URI = "https://bis-platform-production.up.railway.app/auth/vk/callback"
 
 OK_APP_ID = os.environ.get("OK_APP_ID", "")
