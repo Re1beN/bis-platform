@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request, Response, Cookie
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from urllib.parse import urlencode
 import uvicorn
 import requests
 import aiohttp
@@ -908,14 +909,14 @@ class DeletePostRequest(BaseModel):
 
 @app.get("/auth/vk/login")
 async def vk_login():
-    params = (
-        f"client_id={VK_APP_ID}"
-        f"&redirect_uri={VK_REDIRECT_URI}"
-        f"&scope=email"
-        f"&response_type=code"
-        f"&v=5.199"
-        f"&display=page"
-    )
+    params = urlencode({
+        "client_id": VK_APP_ID,
+        "redirect_uri": VK_REDIRECT_URI,
+        "scope": "email",
+        "response_type": "code",
+        "v": "5.199",
+        "display": "page"
+    })
     return RedirectResponse(url=f"https://oauth.vk.com/authorize?{params}")
 
 
@@ -962,13 +963,13 @@ async def vk_callback(request: Request, code: str = None, error: str = None):
 async def ok_login():
     if not OK_APP_ID:
         return JSONResponse(content={"error": "OK_APP_ID not configured"}, status_code=503)
-    params = (
-        f"client_id={OK_APP_ID}"
-        f"&redirect_uri={OK_REDIRECT_URI}"
-        f"&response_type=code"
-        f"&scope=VALUABLE_ACCESS"
-        f"&layout=w"
-    )
+    params = urlencode({
+        "client_id": OK_APP_ID,
+        "redirect_uri": OK_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "VALUABLE_ACCESS",
+        "layout": "w"
+    })
     return RedirectResponse(url=f"https://connect.ok.ru/oauth/authorize?{params}")
 
 
