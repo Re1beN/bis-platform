@@ -1,7 +1,9 @@
 from fastapi import FastAPI, Request, Response, Cookie
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 import uvicorn
 import requests
+import aiohttp
+import hashlib
 import uuid
 import json
 import os
@@ -20,6 +22,24 @@ GIGACHAT_AUTH_KEY = "MDE5ZDMzYzItNGY5NS03MGY4LThjOTktYzk5ZDIyMzYyZTk3OmI5OWRhMTV
 PEXELS_API_KEY = "99lzySAP7wyWqzFaBGPQQbcJWPwXZVaR6H6KbILjvJ5Au6iV6YnrxXM5"
 UNSPLASH_API_KEY = "NpF_z6xsa39ov1PS4Bq_AqIoabRJphW1s30RvnOGCMY"
 gigachat_access_token = None
+
+# ========== VK / OK OAUTH ==========
+VK_APP_ID = "54564776"
+VK_APP_SECRET = "TmmgyUbgiO5FUx7GQ4Mu"
+VK_REDIRECT_URI = "https://bis-platform-production.up.railway.app/auth/vk/callback"
+
+OK_APP_ID = os.environ.get("OK_APP_ID", "")
+OK_APP_SECRET = os.environ.get("OK_APP_SECRET", "")
+OK_REDIRECT_URI = "https://bis-platform-production.up.railway.app/auth/ok/callback"
+
+# In-memory store for guest data (not persisted to disk)
+_guest_memory: dict = {
+    "profile": {
+        "niche": "", "tone": "", "city": "", "goal": "expert",
+        "vk_token": "", "group_id": ""
+    },
+    "posts": []
+}
 
 # ========== DATABASE ==========
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./bis_local.db")
@@ -61,24 +81,74 @@ Base.metadata.create_all(bind=engine)
 
 
 def _get_user_id(request: Request) -> str:
-    """Return the session user_id from cookie, creating one if absent."""
+    """Return the session user_id from cookie; default to 'guest' if absent."""
     user_id = request.cookies.get("bis_user_id")
     if not user_id:
-        user_id = str(uuid.uuid4())
+        user_id = "guest"
     return user_id
+
+
+DEFAULT_PROFILE = {
+    "niche": "", "tone": "", "city": "", "goal": "expert",
+    "vk_token": "", "group_id": ""
+}
+
+
+# ========== GUEST IN-MEMORY HELPERS ==========
+
+def _guest_get_profile() -> dict:
+    return dict(_guest_memory["profile"])
+
+
+def _guest_save_profile(data: dict):
+    _guest_memory["profile"].update({
+        "niche": data.get("niche", ""),
+        "tone": data.get("tone", ""),
+        "city": data.get("city", ""),
+        "goal": data.get("goal", "expert"),
+        "vk_token": data.get("vk_token", ""),
+        "group_id": data.get("group_id", ""),
+    })
+
+
+def _guest_get_posts() -> list:
+    return list(_guest_memory["posts"])
+
+
+def _guest_add_post(text: str, image_url: str, date_str: str = None):
+    date = date_str or datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    _guest_memory["posts"].append({
+        "id": len(_guest_memory["posts"]),
+        "text": text,
+        "image_url": image_url or "",
+        "date": date,
+    })
+
+
+def _guest_delete_post(index: int) -> bool:
+    if index < 0 or index >= len(_guest_memory["posts"]):
+        return False
+    _guest_memory["posts"].pop(index)
+    return True
+
+
+def _guest_get_post_by_index(index: int):
+    if index < 0 or index >= len(_guest_memory["posts"]):
+        return None
+    return _guest_memory["posts"][index]
 
 
 def _db_get_profile(db, user_id: str) -> dict:
     profile = db.query(UserProfile).filter(UserProfile.user_id == user_id).first()
     if not profile:
-        return {}
+        return dict(DEFAULT_PROFILE)
     return {
-        "niche": profile.niche,
-        "tone": profile.tone,
-        "city": profile.city,
-        "goal": profile.goal,
-        "vk_token": profile.vk_token,
-        "group_id": profile.group_id,
+        "niche": profile.niche or "",
+        "tone": profile.tone or "",
+        "city": profile.city or "",
+        "goal": profile.goal or "expert",
+        "vk_token": profile.vk_token or "",
+        "group_id": profile.group_id or "",
     }
 
 
@@ -382,8 +452,27 @@ COMMON_STYLES = """
     .post-actions { display: flex; gap: 10px; }
     .post-actions button { padding: 5px 12px; font-size: 12px; }
     .empty-plan { text-align: center; padding: 40px; color: #888; }
+    .btn-auth { background: linear-gradient(135deg, #ff6600, #ffaa00); color: #000; padding: 8px 20px; border-radius: 20px; font-size: 13px; font-weight: 600; border: none; cursor: pointer; text-decoration: none; transition: 0.3s; display: inline-block; }
+    .btn-auth:hover { transform: scale(1.04); box-shadow: 0 0 16px rgba(255,102,0,0.5); }
+    .btn-logout { background: transparent; border: 1px solid #ff6600; color: #ff6600; padding: 7px 18px; border-radius: 20px; font-size: 13px; cursor: pointer; text-decoration: none; transition: 0.3s; display: inline-block; }
+    .btn-logout:hover { background: rgba(255,102,0,0.15); }
+    .user-badge { font-size: 12px; color: #ffaa00; opacity: 0.85; }
+    .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.75); z-index: 1000; align-items: center; justify-content: center; }
+    .modal-overlay.active { display: flex; }
+    .modal-box { background: rgba(15,15,25,0.97); border: 1px solid rgba(255,102,0,0.4); border-radius: 24px; padding: 40px 36px; max-width: 420px; width: 90%; text-align: center; box-shadow: 0 0 60px rgba(255,102,0,0.2); }
+    .modal-box h2 { font-size: 24px; margin-bottom: 10px; background: linear-gradient(135deg, #fff, #ffaa00); -webkit-background-clip: text; background-clip: text; color: transparent; }
+    .modal-box p { color: #aaa; font-size: 14px; margin-bottom: 28px; }
+    .modal-btn { display: block; width: 100%; padding: 14px; border-radius: 30px; font-size: 15px; font-weight: 600; border: none; cursor: pointer; margin-bottom: 14px; transition: 0.3s; text-decoration: none; }
+    .modal-btn:last-child { margin-bottom: 0; }
+    .modal-btn-vk { background: #0077ff; color: #fff; }
+    .modal-btn-vk:hover { background: #005fcc; }
+    .modal-btn-ok { background: #f7931e; color: #fff; }
+    .modal-btn-ok:hover { background: #d97a10; }
+    .modal-btn-guest { background: transparent; border: 1px solid #555; color: #ccc; }
+    .modal-btn-guest:hover { border-color: #ff6600; color: #ff6600; }
 </style>
 """
+
 
 LANDING_PAGE = """
 <!DOCTYPE html>
@@ -414,7 +503,10 @@ LANDING_PAGE = """
             <a href="/feedback">Обратная связь</a>
             <a href="/tariffs">Тарифы</a>
         </nav>
-        <div class="nav-right"><div class="lang-switch"><span class="active">Lvo</span><span>Ru</span></div></div>
+        <div class="nav-right">
+            <div class="lang-switch"><span class="active">Lvo</span><span>Ru</span></div>
+            <a href="/workspace" class="btn-auth">Вход / Регистрация</a>
+        </div>
     </header>
     <div class="hero"><div class="hero-content"><div class="title"><h1>БИС — <span>БРЕНД. ИМИДЖ. СТРАТЕГИЯ.</span><br>ВСЕ НЕОБХОДИМЫЕ НЕЙРОСЕТИ<br>В ОДНОМ МЕСТЕ!</h1><p>Искусственный интеллект нового поколения для работы с текстом, изображениями и данными</p><a href="/workspace" class="btn-primary">Начать работу!</a></div></div></div>
     <div class="footer"><p>© 2026 БИС — Бренд. Имидж. Стратегия.</p></div>
@@ -470,7 +562,7 @@ TARIFFS_PAGE = """
     <header class="header">
         <div class="logo"><div class="logo-icon"></div><span class="logo-text">БИС</span></div>
         <nav class="nav-menu"><a href="/">Главная</a><a href="/workspace">Рабочая зона</a><a href="/feedback">Обратная связь</a><a href="/tariffs">Тарифы</a></nav>
-        <div class="nav-right"><div class="lang-switch"><span class="active">Lvo</span><span>Ru</span></div></div>
+        <div class="nav-right"><div class="lang-switch"><span class="active">Lvo</span><span>Ru</span></div><a href="/workspace" class="btn-auth">Вход / Регистрация</a></div>
     </header>
     <div class="main-container"><h1>💎 Выберите свой тариф</h1><p style="margin-bottom:30px;opacity:0.8;">Подберите оптимальный план для вашего бизнеса</p>
     <div class="pricing-grid">
@@ -495,7 +587,7 @@ FEEDBACK_PAGE = """
     <header class="header">
         <div class="logo"><div class="logo-icon"></div><span class="logo-text">БИС</span></div>
         <nav class="nav-menu"><a href="/">Главная</a><a href="/workspace">Рабочая зона</a><a href="/feedback">Обратная связь</a><a href="/tariffs">Тарифы</a></nav>
-        <div class="nav-right"><div class="lang-switch"><span class="active">Lvo</span><span>Ru</span></div></div>
+        <div class="nav-right"><div class="lang-switch"><span class="active">Lvo</span><span>Ru</span></div><a href="/workspace" class="btn-auth">Вход / Регистрация</a></div>
     </header>
     <div class="main-container"><h1>📞 Обратная связь</h1><div class="card" style="text-align:center;"><h2>Наши контакты</h2><div class="contact-info"><div class="contact-item">📨 <strong>Telegram:</strong> <a href="https://t.me/T5bank" target="_blank">@T5bank</a></div><div class="contact-item">📘 <strong>VK:</strong> <a href="https://vk.com/tbank_russia" target="_blank">tbank_russia</a></div><div class="contact-item">✉️ <strong>Email:</strong> <a href="mailto:apogosan135@gmail.com">apogosan135@gmail.com</a></div></div></div></div>
     <div class="footer"><p>© 2026 БИС — Бренд. Имидж. Стратегия.</p></div>
@@ -511,11 +603,26 @@ WORKSPACE_PAGE = """
 <head><meta charset="UTF-8"><title>БИС — Рабочая зона</title>""" + COMMON_STYLES + """</head>
 <body>
 <div class="stars" id="stars"></div>
+
+<!-- Auth Modal -->
+<div class="modal-overlay" id="authModal">
+    <div class="modal-box">
+        <h2>Добро пожаловать в БИС</h2>
+        <p>Войдите, чтобы сохранять данные, или продолжите как гость</p>
+        <a href="/auth/vk/login" class="modal-btn modal-btn-vk">🔵 Войти через VK</a>
+        <a href="/auth/ok/login" class="modal-btn modal-btn-ok">🟠 Войти через Одноклассники</a>
+        <button class="modal-btn modal-btn-guest" onclick="stayAsGuest()">👤 Остаться гостем</button>
+    </div>
+</div>
+
 <div class="content">
     <header class="header">
         <div class="logo"><div class="logo-icon"></div><span class="logo-text">БИС</span></div>
         <nav class="nav-menu"><a href="/">Главная</a><a href="/workspace">Рабочая зона</a><a href="/feedback">Обратная связь</a><a href="/tariffs">Тарифы</a></nav>
-        <div class="nav-right"><div class="lang-switch"><span class="active">Lvo</span><span>Ru</span></div></div>
+        <div class="nav-right" id="headerAuthArea">
+            <div class="lang-switch"><span class="active">Lvo</span><span>Ru</span></div>
+            <!-- Populated by JS based on auth status -->
+        </div>
     </header>
     <div class="main-container">
         <h1>БИС AI</h1>
@@ -594,6 +701,41 @@ WORKSPACE_PAGE = """
     let currentFormat = 'post', currentText = '', currentImageUrl = '';
     function createStars(){for(let i=0;i<200;i++){let s=document.createElement('div');s.classList.add('star');s.style.cssText=`width:${Math.random()*2+1}px;height:${Math.random()*2+1}px;left:${Math.random()*100}%;top:${Math.random()*100}%;animation-delay:${Math.random()*5}s`;document.getElementById('stars').appendChild(s);}}
     createStars();
+
+    // ---- Auth check on load ----
+    async function checkAuth() {
+        try {
+            let resp = await fetch('/api/auth-status');
+            let data = await resp.json();
+            let area = document.getElementById('headerAuthArea');
+            if (data.authenticated) {
+                let label = data.user_id.startsWith('vk_') ? '🔵 VK' : data.user_id.startsWith('ok_') ? '🟠 OK' : '👤 Гость';
+                area.innerHTML = `<div class="lang-switch"><span class="active">Lvo</span><span>Ru</span></div>
+                    <span class="user-badge">${label}</span>
+                    <a href="/auth/logout" class="btn-logout">Выйти</a>`;
+                // Hide modal — user already has a cookie
+            } else {
+                area.innerHTML = `<div class="lang-switch"><span class="active">Lvo</span><span>Ru</span></div>
+                    <a href="#" class="btn-auth" onclick="document.getElementById('authModal').classList.add('active');return false;">Вход / Регистрация</a>`;
+                // Show modal on first visit (no cookie at all)
+                document.getElementById('authModal').classList.add('active');
+            }
+        } catch(e) {
+            document.getElementById('authModal').classList.add('active');
+        }
+    }
+
+    async function stayAsGuest() {
+        await fetch('/auth/guest');
+        document.getElementById('authModal').classList.remove('active');
+        let area = document.getElementById('headerAuthArea');
+        area.innerHTML = `<div class="lang-switch"><span class="active">Lvo</span><span>Ru</span></div>
+            <span class="user-badge">👤 Гость</span>
+            <a href="/auth/logout" class="btn-logout">Выйти</a>`;
+    }
+
+    checkAuth();
+
     function selectFormat(f){currentFormat=f;document.querySelectorAll('.format-btn').forEach(b=>b.classList.remove('active'));event.target.classList.add('active');}
     async function generatePost(){
         let topic=document.getElementById('topicInput').value, resDiv=document.getElementById('resultText');
@@ -729,8 +871,10 @@ WORKSPACE_PAGE = """
 </html>
 """
 
+
 from pydantic import BaseModel
 from typing import Optional
+
 
 
 class GenerateRequest(BaseModel):
@@ -760,17 +904,179 @@ class DeletePostRequest(BaseModel):
     index: int
 
 
+# ========== AUTH ENDPOINTS ==========
+
+@app.get("/auth/vk/login")
+async def vk_login():
+    params = (
+        f"client_id={VK_APP_ID}"
+        f"&redirect_uri={VK_REDIRECT_URI}"
+        f"&scope=email"
+        f"&response_type=code"
+        f"&v=5.199"
+        f"&display=page"
+    )
+    return RedirectResponse(url=f"https://oauth.vk.com/authorize?{params}")
+
+
+@app.get("/auth/vk/callback")
+async def vk_callback(request: Request, code: str = None, error: str = None):
+    if error or not code:
+        return RedirectResponse(url="/workspace")
+    try:
+        token_resp = requests.get(
+            "https://oauth.vk.com/access_token",
+            params={
+                "client_id": VK_APP_ID,
+                "client_secret": VK_APP_SECRET,
+                "redirect_uri": VK_REDIRECT_URI,
+                "code": code,
+            },
+            timeout=15,
+        )
+        token_data = token_resp.json()
+        vk_id = token_data.get("user_id")
+        if not vk_id:
+            return RedirectResponse(url="/workspace")
+        user_id = f"vk_{vk_id}"
+        # Ensure profile row exists in DB
+        db = SessionLocal()
+        try:
+            existing = _db_get_profile(db, user_id)
+            if not existing or existing == DEFAULT_PROFILE:
+                _db_save_profile(db, user_id, DEFAULT_PROFILE)
+        finally:
+            db.close()
+        resp = RedirectResponse(url="/workspace")
+        resp.set_cookie(
+            key="bis_user_id", value=user_id,
+            max_age=60 * 60 * 24 * 30, httponly=True, samesite="lax"
+        )
+        return resp
+    except Exception as e:
+        print(f"VK callback error: {e}")
+        return RedirectResponse(url="/workspace")
+
+
+@app.get("/auth/ok/login")
+async def ok_login():
+    if not OK_APP_ID:
+        return JSONResponse(content={"error": "OK_APP_ID not configured"}, status_code=503)
+    params = (
+        f"client_id={OK_APP_ID}"
+        f"&redirect_uri={OK_REDIRECT_URI}"
+        f"&response_type=code"
+        f"&scope=VALUABLE_ACCESS"
+        f"&layout=w"
+    )
+    return RedirectResponse(url=f"https://connect.ok.ru/oauth/authorize?{params}")
+
+
+@app.get("/auth/ok/callback")
+async def ok_callback(request: Request, code: str = None, error: str = None):
+    if error or not code:
+        return RedirectResponse(url="/workspace")
+    if not OK_APP_ID or not OK_APP_SECRET:
+        return RedirectResponse(url="/workspace")
+    try:
+        token_resp = requests.post(
+            "https://api.ok.ru/oauth/token.do",
+            data={
+                "code": code,
+                "redirect_uri": OK_REDIRECT_URI,
+                "grant_type": "authorization_code",
+                "client_id": OK_APP_ID,
+                "client_secret": OK_APP_SECRET,
+            },
+            timeout=15,
+        )
+        token_data = token_resp.json()
+        access_token = token_data.get("access_token")
+        if not access_token:
+            return RedirectResponse(url="/workspace")
+        # Get user info
+        sig_base = f"application_key={os.environ.get('OK_PUBLIC_KEY', '')}fields=uid,name" \
+                   f"format=jsonmethod=users.getCurrentUser" \
+                   f"{hashlib.md5((access_token + OK_APP_SECRET).encode()).hexdigest()}"
+        sig = hashlib.md5(sig_base.encode()).hexdigest()
+        user_resp = requests.get(
+            "https://api.ok.ru/fb.do",
+            params={
+                "method": "users.getCurrentUser",
+                "access_token": access_token,
+                "application_key": os.environ.get("OK_PUBLIC_KEY", ""),
+                "fields": "uid,name",
+                "format": "json",
+                "sig": sig,
+            },
+            timeout=15,
+        )
+        user_data = user_resp.json()
+        ok_id = user_data.get("uid")
+        if not ok_id:
+            return RedirectResponse(url="/workspace")
+        user_id = f"ok_{ok_id}"
+        db = SessionLocal()
+        try:
+            existing = _db_get_profile(db, user_id)
+            if not existing or existing == DEFAULT_PROFILE:
+                _db_save_profile(db, user_id, DEFAULT_PROFILE)
+        finally:
+            db.close()
+        resp = RedirectResponse(url="/workspace")
+        resp.set_cookie(
+            key="bis_user_id", value=user_id,
+            max_age=60 * 60 * 24 * 30, httponly=True, samesite="lax"
+        )
+        return resp
+    except Exception as e:
+        print(f"OK callback error: {e}")
+        return RedirectResponse(url="/workspace")
+
+
+@app.get("/auth/guest")
+async def auth_guest():
+    resp = JSONResponse(content={"user_id": "guest", "mode": "guest"})
+    resp.set_cookie(
+        key="bis_user_id", value="guest",
+        max_age=60 * 60,  # 1 hour
+        httponly=False, samesite="lax"
+    )
+    return resp
+
+
+@app.get("/auth/logout")
+async def auth_logout():
+    resp = RedirectResponse(url="/")
+    resp.delete_cookie(key="bis_user_id")
+    return resp
+
+
+@app.get("/api/auth-status")
+async def auth_status(request: Request):
+    user_id = request.cookies.get("bis_user_id")
+    if not user_id:
+        return JSONResponse(content={"authenticated": False, "user_id": None})
+    return JSONResponse(content={"authenticated": True, "user_id": user_id})
+
+
 # ========== API ENDPOINTS ==========
 
+def _is_guest(user_id: str) -> bool:
+    return user_id == "guest"
+
+
 @app.post("/api/generate")
-async def generate(req: GenerateRequest, request: Request, response: Response):
+async def generate(req: GenerateRequest, request: Request):
     user_id = _get_user_id(request)
-    response.set_cookie(key="bis_user_id", value=user_id, max_age=60 * 60 * 24 * 365, httponly=True, samesite="lax")
-    db = SessionLocal()
-    try:
-        profile = _db_get_profile(db, user_id)
-    finally:
-        db.close()
+    if _is_guest(user_id):
+        profile = _guest_get_profile()
+    else:
+        db = SessionLocal()
+        try:
+            profile = _db_get_profile(db, user_id)
+        finally:
+            db.close()
     result = call_gigachat(req.prompt, profile)
     return JSONResponse(content={"result": result})
 
@@ -784,57 +1090,72 @@ async def generate_image(prompt: str):
 
 
 @app.post("/api/add-to-plan")
-async def add_to_plan(req: AddPostRequest, request: Request, response: Response):
+async def add_to_plan(req: AddPostRequest, request: Request):
     user_id = _get_user_id(request)
-    response.set_cookie(key="bis_user_id", value=user_id, max_age=60 * 60 * 24 * 365, httponly=True, samesite="lax")
-    db = SessionLocal()
-    try:
-        _db_add_post(db, user_id, req.text, req.image_url or "", req.date)
-    finally:
-        db.close()
+    if _is_guest(user_id):
+        _guest_add_post(req.text, req.image_url or "", req.date)
+    else:
+        db = SessionLocal()
+        try:
+            _db_add_post(db, user_id, req.text, req.image_url or "", req.date)
+        finally:
+            db.close()
     return JSONResponse(content={"message": "✅ Пост добавлен в контент-план!"})
 
 
 @app.get("/api/get-posts")
-async def get_posts(request: Request, response: Response):
+async def get_posts(request: Request):
     user_id = _get_user_id(request)
-    response.set_cookie(key="bis_user_id", value=user_id, max_age=60 * 60 * 24 * 365, httponly=True, samesite="lax")
-    db = SessionLocal()
-    try:
-        posts = _db_get_posts(db, user_id)
-    finally:
-        db.close()
+    if _is_guest(user_id):
+        posts = _guest_get_posts()
+    else:
+        db = SessionLocal()
+        try:
+            posts = _db_get_posts(db, user_id)
+        finally:
+            db.close()
     return JSONResponse(content=posts)
 
 
 @app.post("/api/publish-post-from-plan")
-async def publish_post_from_plan(req: PublishFromPlanRequest, request: Request, response: Response):
+async def publish_post_from_plan(req: PublishFromPlanRequest, request: Request):
     user_id = _get_user_id(request)
-    response.set_cookie(key="bis_user_id", value=user_id, max_age=60 * 60 * 24 * 365, httponly=True, samesite="lax")
-    db = SessionLocal()
-    try:
-        post = _db_get_post_by_index(db, user_id, req.index)
+    if _is_guest(user_id):
+        post = _guest_get_post_by_index(req.index)
         if not post:
             return JSONResponse(content={"message": "❌ Пост не найден", "success": False})
-        result = publish_to_vk_wall(post.text, post.image_url, req.vk_token, req.group_id)
+        result = publish_to_vk_wall(post["text"], post.get("image_url", ""), req.vk_token, req.group_id)
         if "✅" in result:
-            db.delete(post)
-            db.commit()
+            _guest_delete_post(req.index)
             return JSONResponse(content={"message": result, "success": True})
         return JSONResponse(content={"message": result, "success": False})
-    finally:
-        db.close()
+    else:
+        db = SessionLocal()
+        try:
+            post = _db_get_post_by_index(db, user_id, req.index)
+            if not post:
+                return JSONResponse(content={"message": "❌ Пост не найден", "success": False})
+            result = publish_to_vk_wall(post.text, post.image_url, req.vk_token, req.group_id)
+            if "✅" in result:
+                db.delete(post)
+                db.commit()
+                return JSONResponse(content={"message": result, "success": True})
+            return JSONResponse(content={"message": result, "success": False})
+        finally:
+            db.close()
 
 
 @app.post("/api/delete-post")
-async def delete_post(req: DeletePostRequest, request: Request, response: Response):
+async def delete_post(req: DeletePostRequest, request: Request):
     user_id = _get_user_id(request)
-    response.set_cookie(key="bis_user_id", value=user_id, max_age=60 * 60 * 24 * 365, httponly=True, samesite="lax")
-    db = SessionLocal()
-    try:
-        deleted = _db_delete_post_by_index(db, user_id, req.index)
-    finally:
-        db.close()
+    if _is_guest(user_id):
+        deleted = _guest_delete_post(req.index)
+    else:
+        db = SessionLocal()
+        try:
+            deleted = _db_delete_post_by_index(db, user_id, req.index)
+        finally:
+            db.close()
     if deleted:
         return JSONResponse(content={"message": "✅ Пост удалён"})
     return JSONResponse(content={"message": "❌ Пост не найден"})
@@ -851,10 +1172,12 @@ async def publish_to_vk(req: PublishRequest):
 
 
 @app.post("/api/save-profile")
-async def save_profile(request: Request, response: Response):
+async def save_profile(request: Request):
     user_id = _get_user_id(request)
-    response.set_cookie(key="bis_user_id", value=user_id, max_age=60 * 60 * 24 * 365, httponly=True, samesite="lax")
     data = await request.json()
+    if _is_guest(user_id):
+        _guest_save_profile(data)
+        return JSONResponse(content={"message": "✅ Настройки сохранены (только для текущей сессии — вы гость)!"})
     db = SessionLocal()
     try:
         _db_save_profile(db, user_id, data)
@@ -864,14 +1187,16 @@ async def save_profile(request: Request, response: Response):
 
 
 @app.get("/api/get-profile")
-async def get_profile(request: Request, response: Response):
+async def get_profile(request: Request):
     user_id = _get_user_id(request)
-    response.set_cookie(key="bis_user_id", value=user_id, max_age=60 * 60 * 24 * 365, httponly=True, samesite="lax")
-    db = SessionLocal()
-    try:
-        profile = _db_get_profile(db, user_id)
-    finally:
-        db.close()
+    if _is_guest(user_id):
+        profile = _guest_get_profile()
+    else:
+        db = SessionLocal()
+        try:
+            profile = _db_get_profile(db, user_id)
+        finally:
+            db.close()
     return JSONResponse(content=profile)
 
 
