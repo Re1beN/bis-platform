@@ -24,14 +24,20 @@ PEXELS_API_KEY = "99lzySAP7wyWqzFaBGPQQbcJWPwXZVaR6H6KbILjvJ5Au6iV6YnrxXM5"
 UNSPLASH_API_KEY = "NpF_z6xsa39ov1PS4Bq_AqIoabRJphW1s30RvnOGCMY"
 gigachat_access_token = None
 
-# ========== VK / OK OAUTH ==========
-VK_APP_ID = "54564776"
-VK_APP_SECRET = "TmmgyUbgiO5FUx7GQ4Mu"
-VK_REDIRECT_URI = "https://bis-platform-production.up.railway.app/auth/vk/callback"
+# ========== VK / OK OAUTH (kept for future use) ==========
+# VK_APP_ID = "54564776"
+# VK_APP_SECRET = "TmmgyUbgiO5FUx7GQ4Mu"
+# VK_REDIRECT_URI = "https://bis-platform-production.up.railway.app/auth/vk/callback"
 
-OK_APP_ID = os.environ.get("OK_APP_ID", "")
-OK_APP_SECRET = os.environ.get("OK_APP_SECRET", "")
-OK_REDIRECT_URI = "https://bis-platform-production.up.railway.app/auth/ok/callback"
+# OK_APP_ID = os.environ.get("OK_APP_ID", "")
+# OK_APP_SECRET = os.environ.get("OK_APP_SECRET", "")
+# OK_REDIRECT_URI = "https://bis-platform-production.up.railway.app/auth/ok/callback"
+
+# ========== YANDEX OAUTH ==========
+YANDEX_CLIENT_ID = "4b1a46bce79b431b8930cff6ce7a8aaa"
+YANDEX_CLIENT_SECRET = "9defc0d9f9764264a1e8cdcb618998b4"
+YANDEX_REDIRECT_URI = "https://bis-platform-production.up.railway.app/workspace"
+
 
 # In-memory store for guest data (not persisted to disk)
 _guest_memory: dict = {
@@ -465,12 +471,10 @@ COMMON_STYLES = """
     .modal-box p { color: #aaa; font-size: 14px; margin-bottom: 28px; }
     .modal-btn { display: block; width: 100%; padding: 14px; border-radius: 30px; font-size: 15px; font-weight: 600; border: none; cursor: pointer; margin-bottom: 14px; transition: 0.3s; text-decoration: none; }
     .modal-btn:last-child { margin-bottom: 0; }
-    .modal-btn-vk { background: #0077ff; color: #fff; }
-    .modal-btn-vk:hover { background: #005fcc; }
-    .modal-btn-ok { background: #f7931e; color: #fff; }
-    .modal-btn-ok:hover { background: #d97a10; }
+    .modal-btn-yandex { background: #fc3f1d; color: #fff; }
+    .modal-btn-yandex:hover { background: #d93518; }
     .modal-btn-guest { background: transparent; border: 1px solid #555; color: #ccc; }
-    .modal-btn-guest:hover { border-color: #ff6600; color: #ff6600; }
+
 </style>
 """
 
@@ -610,8 +614,8 @@ WORKSPACE_PAGE = """
     <div class="modal-box">
         <h2>Добро пожаловать в БИС</h2>
         <p>Войдите, чтобы сохранять данные, или продолжите как гость</p>
-        <a href="/auth/vk/login" class="modal-btn modal-btn-vk">🔵 Войти через VK</a>
-        <a href="/auth/ok/login" class="modal-btn modal-btn-ok">🟠 Войти через Одноклассники</a>
+        <a href="/auth/yandex/login" class="modal-btn modal-btn-yandex">🟡 Войти через Яндекс</a>
+
         <button class="modal-btn modal-btn-guest" onclick="stayAsGuest()">👤 Остаться гостем</button>
     </div>
 </div>
@@ -710,7 +714,8 @@ WORKSPACE_PAGE = """
             let data = await resp.json();
             let area = document.getElementById('headerAuthArea');
             if (data.authenticated) {
-                let label = data.user_id.startsWith('vk_') ? '🔵 VK' : data.user_id.startsWith('ok_') ? '🟠 OK' : '👤 Гость';
+                let label = data.user_id.startsWith('yandex_') ? '🟡 Яндекс' : '👤 Гость';
+
                 area.innerHTML = `<div class="lang-switch"><span class="active">Lvo</span><span>Ru</span></div>
                     <span class="user-badge">${label}</span>
                     <a href="/auth/logout" class="btn-logout">Выйти</a>`;
@@ -907,39 +912,50 @@ class DeletePostRequest(BaseModel):
 
 # ========== AUTH ENDPOINTS ==========
 
-@app.get("/auth/vk/login")
-async def vk_login():
+@app.get("/auth/yandex/login")
+async def yandex_login():
     params = urlencode({
-        "client_id": VK_APP_ID,
-        "redirect_uri": VK_REDIRECT_URI,
-        "scope": "email",
         "response_type": "code",
-        "v": "5.199",
-        "display": "page"
+        "client_id": YANDEX_CLIENT_ID,
+        "redirect_uri": YANDEX_REDIRECT_URI,
+        "force_confirm": "yes",
     })
-    return RedirectResponse(url=f"https://oauth.vk.com/authorize?{params}")
+    return RedirectResponse(url=f"https://oauth.yandex.com/authorize?{params}")
 
 
-@app.get("/auth/vk/callback")
-async def vk_callback(request: Request, code: str = None, error: str = None):
+@app.get("/auth/yandex/callback")
+async def yandex_callback(request: Request, code: str = None, error: str = None):
     if error or not code:
         return RedirectResponse(url="/workspace")
     try:
-        token_resp = requests.get(
-            "https://oauth.vk.com/access_token",
-            params={
-                "client_id": VK_APP_ID,
-                "client_secret": VK_APP_SECRET,
-                "redirect_uri": VK_REDIRECT_URI,
+        # Exchange code for access token
+        token_resp = requests.post(
+            "https://oauth.yandex.com/token",
+            data={
+                "grant_type": "authorization_code",
                 "code": code,
+                "client_id": YANDEX_CLIENT_ID,
+                "client_secret": YANDEX_CLIENT_SECRET,
+                "redirect_uri": YANDEX_REDIRECT_URI,
             },
             timeout=15,
         )
         token_data = token_resp.json()
-        vk_id = token_data.get("user_id")
-        if not vk_id:
+        access_token = token_data.get("access_token")
+        if not access_token:
             return RedirectResponse(url="/workspace")
-        user_id = f"vk_{vk_id}"
+        # Get user info (email) from Yandex
+        user_resp = requests.get(
+            "https://login.yandex.ru/info",
+            params={"format": "json"},
+            headers={"Authorization": f"OAuth {access_token}"},
+            timeout=15,
+        )
+        user_data = user_resp.json()
+        email = user_data.get("default_email") or user_data.get("emails", [None])[0]
+        if not email:
+            return RedirectResponse(url="/workspace")
+        user_id = f"yandex_{email}"
         # Ensure profile row exists in DB
         db = SessionLocal()
         try:
@@ -955,84 +971,9 @@ async def vk_callback(request: Request, code: str = None, error: str = None):
         )
         return resp
     except Exception as e:
-        print(f"VK callback error: {e}")
+        print(f"Yandex callback error: {e}")
         return RedirectResponse(url="/workspace")
 
-
-@app.get("/auth/ok/login")
-async def ok_login():
-    if not OK_APP_ID:
-        return JSONResponse(content={"error": "OK_APP_ID not configured"}, status_code=503)
-    params = urlencode({
-        "client_id": OK_APP_ID,
-        "redirect_uri": OK_REDIRECT_URI,
-        "response_type": "code",
-        "scope": "VALUABLE_ACCESS",
-        "layout": "w"
-    })
-    return RedirectResponse(url=f"https://connect.ok.ru/oauth/authorize?{params}")
-
-
-@app.get("/auth/ok/callback")
-async def ok_callback(request: Request, code: str = None, error: str = None):
-    if error or not code:
-        return RedirectResponse(url="/workspace")
-    if not OK_APP_ID or not OK_APP_SECRET:
-        return RedirectResponse(url="/workspace")
-    try:
-        token_resp = requests.post(
-            "https://api.ok.ru/oauth/token.do",
-            data={
-                "code": code,
-                "redirect_uri": OK_REDIRECT_URI,
-                "grant_type": "authorization_code",
-                "client_id": OK_APP_ID,
-                "client_secret": OK_APP_SECRET,
-            },
-            timeout=15,
-        )
-        token_data = token_resp.json()
-        access_token = token_data.get("access_token")
-        if not access_token:
-            return RedirectResponse(url="/workspace")
-        # Get user info
-        sig_base = f"application_key={os.environ.get('OK_PUBLIC_KEY', '')}fields=uid,name" \
-                   f"format=jsonmethod=users.getCurrentUser" \
-                   f"{hashlib.md5((access_token + OK_APP_SECRET).encode()).hexdigest()}"
-        sig = hashlib.md5(sig_base.encode()).hexdigest()
-        user_resp = requests.get(
-            "https://api.ok.ru/fb.do",
-            params={
-                "method": "users.getCurrentUser",
-                "access_token": access_token,
-                "application_key": os.environ.get("OK_PUBLIC_KEY", ""),
-                "fields": "uid,name",
-                "format": "json",
-                "sig": sig,
-            },
-            timeout=15,
-        )
-        user_data = user_resp.json()
-        ok_id = user_data.get("uid")
-        if not ok_id:
-            return RedirectResponse(url="/workspace")
-        user_id = f"ok_{ok_id}"
-        db = SessionLocal()
-        try:
-            existing = _db_get_profile(db, user_id)
-            if not existing or existing == DEFAULT_PROFILE:
-                _db_save_profile(db, user_id, DEFAULT_PROFILE)
-        finally:
-            db.close()
-        resp = RedirectResponse(url="/workspace")
-        resp.set_cookie(
-            key="bis_user_id", value=user_id,
-            max_age=60 * 60 * 24 * 30, httponly=True, samesite="lax"
-        )
-        return resp
-    except Exception as e:
-        print(f"OK callback error: {e}")
-        return RedirectResponse(url="/workspace")
 
 
 @app.get("/auth/guest")
@@ -1206,8 +1147,50 @@ async def landing():
     return HTMLResponse(content=LANDING_PAGE)
 
 
-@app.get("/workspace", response_class=HTMLResponse)
-async def workspace():
+@app.get("/workspace")
+async def workspace(request: Request, code: str = None, error: str = None):
+    # Handle Yandex OAuth callback (redirect_uri points here)
+    if code:
+        try:
+            token_resp = requests.post(
+                "https://oauth.yandex.com/token",
+                data={
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "client_id": YANDEX_CLIENT_ID,
+                    "client_secret": YANDEX_CLIENT_SECRET,
+                    "redirect_uri": YANDEX_REDIRECT_URI,
+                },
+                timeout=15,
+            )
+            token_data = token_resp.json()
+            access_token = token_data.get("access_token")
+            if access_token:
+                user_resp = requests.get(
+                    "https://login.yandex.ru/info",
+                    params={"format": "json"},
+                    headers={"Authorization": f"OAuth {access_token}"},
+                    timeout=15,
+                )
+                user_data = user_resp.json()
+                email = user_data.get("default_email") or (user_data.get("emails") or [None])[0]
+                if email:
+                    user_id = f"yandex_{email}"
+                    db = SessionLocal()
+                    try:
+                        existing = _db_get_profile(db, user_id)
+                        if not existing or existing == DEFAULT_PROFILE:
+                            _db_save_profile(db, user_id, DEFAULT_PROFILE)
+                    finally:
+                        db.close()
+                    resp = RedirectResponse(url="/workspace")
+                    resp.set_cookie(
+                        key="bis_user_id", value=user_id,
+                        max_age=60 * 60 * 24 * 30, httponly=True, samesite="lax"
+                    )
+                    return resp
+        except Exception as e:
+            print(f"Yandex workspace callback error: {e}")
     return HTMLResponse(content=WORKSPACE_PAGE)
 
 
